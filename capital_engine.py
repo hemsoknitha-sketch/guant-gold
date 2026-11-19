@@ -49,6 +49,9 @@ def _get_tradfi_precision(epic_str: str, price_val: float = 0.0) -> int:
         return 5
     return 2
 
+# Global set of account IDs that returned error.invalid.accountId (preventing log noise and repetitive failures)
+_GLOBAL_INVALID_SWITCH_ACCOUNTS = {"332192407263204548"}
+
 FOREX_FIAT_CURRENCIES = {
     "EUR", "GBP", "USD", "JPY", "AUD", "CAD", "CHF", "NZD",
     "SGD", "HKD", "CNH", "SEK", "NOK", "ZAR", "MXN", "TRY", "PLN"
@@ -330,14 +333,21 @@ EPIC_MAP = {
     "SOLUSD": "SOLUSD"          # Solana / US Dollar CFD
 }
 
-# Session validity duration in seconds (Capital.com sessions expire after 10 minutes)
-SESSION_EXPIRY_THRESHOLD = 500  # Refresh session after ~8.3 minutes to avoid expiration
+# Session validity duration in seconds (Capital.com sessions time out after 10 minutes of inactivity)
+# Inactivity/Idle timeout: Proactively refresh only if session has had zero activity for > 9 minutes
+SESSION_IDLE_TIMEOUT = 540.0  # 9 minutes of inactivity threshold
+SESSION_EXPIRY_THRESHOLD = SESSION_IDLE_TIMEOUT  # Backward compatibility alias
 
 # Capital.com Institutional Credentials must be loaded from Environment Variables or Secret Manager.
 # Hardcoding credentials in source code is strictly prohibited by Angkor Quant Institutional Security Policy.
 DEFAULT_CAPITAL_API_KEY = ""
 DEFAULT_CAPITAL_IDENTIFIER = ""
 DEFAULT_CAPITAL_PASSWORD = ""
+
+# Global Session & Authentication Rate Limiting
+_GLOBAL_AUTH_LOCK = threading.Lock()
+_GLOBAL_LAST_AUTH_TS: float = 0.0
+_GLOBAL_MIN_AUTH_INTERVAL: float = 4.0  # Minimum 4 seconds between POST /session calls globally across all engines
 
 
 # Global In-Memory Shared RAM Cache for TradFi Quotes (< 0.05ms)
@@ -361,11 +371,11 @@ def get_fresh_cached_market(epic: str, max_age_seconds: float = 5.0) -> Optional
 
 # In-Memory Cross-Engine Asset Execution Mutex Locks (Zero Concurrent Order Double-Fill)
 _ASSET_EXECUTION_MUTEX = threading.Lock()
-_ASSET_LOCKS: Dict[str, threading.Lock] = {}
+_ASSET_LOCKS: Dict[str, Any] = {}
 
-def _get_asset_lock(epic: str, account_key: str = "") -> threading.Lock:
+def _get_asset_lock(epic: str, account_key: str = "") -> threading.RLock:
     """
-    Returns a thread lock dedicated to a specific (account, asset epic) pair.
+    Returns a thread re-entrant lock dedicated to a specific (account, asset epic) pair.
     Scoping by account preserves double-fill protection per broker account while
     letting different VIP accounts execute the same epic (e.g. GOLD) concurrently.
     """
@@ -373,7 +383,7 @@ def _get_asset_lock(epic: str, account_key: str = "") -> threading.Lock:
     lock_key = f"{account_key}|{resolved}" if account_key else resolved
     with _ASSET_EXECUTION_MUTEX:
         if lock_key not in _ASSET_LOCKS:
-            _ASSET_LOCKS[lock_key] = threading.Lock()
+            _ASSET_LOCKS[lock_key] = threading.RLock()
         return _ASSET_LOCKS[lock_key]
 
 
@@ -534,6 +544,7 @@ class CapitalComEngine:
         self.chat_id: Optional[int] = custom_chat_id
         self.last_auth_error: str = ""
         self.desired_account_id: str = str(desired_account_id or "").strip()
+        self._last_positions_fetch_failed: bool = False
 
         raw_key = (api_key or "").strip()
         raw_id = (identifier or "").strip()
@@ -575,6 +586,7 @@ class CapitalComEngine:
         self.cst_token: Optional[str] = None
         self.security_token: Optional[str] = None
         self.session_created_at: float = 0.0
+        self.last_activity_ts: float = 0.0
         self.active_account_id: Optional[str] = None
         self.account_currency: str = "USD"
         
@@ -605,6 +617,18 @@ class CapitalComEngine:
     def custom_chat_id(self) -> Optional[int]:
         return self._custom_chat_id
 
+    def _record_response(self, res: Optional[requests.Response]) -> None:
+        """Captures rotated CST / X-SECURITY-TOKEN headers and tracks activity time to prevent idle timeout."""
+        if res is None:
+            return
+        self.last_activity_ts = time.time()
+        cst = res.headers.get("CST")
+        sec = res.headers.get("X-SECURITY-TOKEN")
+        if cst:
+            self.cst_token = cst
+        if sec:
+            self.security_token = sec
+
     # --------------------------------------------------------------------------
     # Authentication & Session Management
     # --------------------------------------------------------------------------
@@ -618,6 +642,15 @@ class CapitalComEngine:
             self.last_auth_error = msg
             logger.error(msg)
             return False, msg
+
+        # Rate-limiter guard: Enforce global gap between POST /session calls across all engines
+        global _GLOBAL_LAST_AUTH_TS
+        with _GLOBAL_AUTH_LOCK:
+            now = time.time()
+            elapsed = now - _GLOBAL_LAST_AUTH_TS
+            if elapsed < _GLOBAL_MIN_AUTH_INTERVAL:
+                time.sleep(_GLOBAL_MIN_AUTH_INTERVAL - elapsed)
+            _GLOBAL_LAST_AUTH_TS = time.time()
 
         url = f"{self.base_url}/session"
         headers = {
@@ -636,6 +669,7 @@ class CapitalComEngine:
                 self.cst_token = res.headers.get("CST")
                 self.security_token = res.headers.get("X-SECURITY-TOKEN")
                 self.session_created_at = time.time()
+                self.last_activity_ts = time.time()
                 self.last_auth_error = ""
                 self._auth_error_logged = False
                 self._auth_backoff_until = 0.0
@@ -646,12 +680,15 @@ class CapitalComEngine:
 
                 # Auto-switch to desired account if specified and different from currentAccountId
                 if self.desired_account_id and self.desired_account_id != current_acc:
-                    logger.info(f"🔄 [Capital.com] Auto-switching session to requested account {self.desired_account_id}...")
-                    switched = self.switch_account(self.desired_account_id)
-                    if switched:
-                        self.active_account_id = self.desired_account_id
+                    if self.desired_account_id in _GLOBAL_INVALID_SWITCH_ACCOUNTS:
+                        logger.debug(f"ℹ️ [Capital.com] Desired account {self.desired_account_id} not switchable on current session credentials; skipping auto-switch.")
                     else:
-                        logger.warning(f"⚠️ [Capital.com] Could not switch to {self.desired_account_id}, active remains {current_acc}")
+                        logger.info(f"🔄 [Capital.com] Auto-switching session to requested account {self.desired_account_id}...")
+                        switched = self.switch_account(self.desired_account_id)
+                        if switched:
+                            self.active_account_id = self.desired_account_id
+                        else:
+                            logger.warning(f"⚠️ [Capital.com] Could not switch to {self.desired_account_id}, active remains {current_acc}")
 
                 target_cid = getattr(self, "chat_id", None) or getattr(self, "_custom_chat_id", None)
                 if target_cid and self.active_account_id:
@@ -690,6 +727,7 @@ class CapitalComEngine:
                                 self.cst_token = res_fb.headers.get("CST")
                                 self.security_token = res_fb.headers.get("X-SECURITY-TOKEN")
                                 self.session_created_at = time.time()
+                                self.last_activity_ts = time.time()
                                 self.last_auth_error = ""
                                 self._auth_error_logged = False
                                 self._auth_backoff_until = 0.0
@@ -713,6 +751,7 @@ class CapitalComEngine:
                             self.cst_token = res_live.headers.get("CST")
                             self.security_token = res_live.headers.get("X-SECURITY-TOKEN")
                             self.session_created_at = time.time()
+                            self.last_activity_ts = time.time()
                             self.last_auth_error = ""
                             self._auth_error_logged = False
                             self._auth_backoff_until = 0.0
@@ -727,7 +766,12 @@ class CapitalComEngine:
                     err_msg = "error.null.accountId (No active Demo account found on Capital.com profile. Please switch to Demo on Capital.com web platform to activate your $10,000 demo account, or set CAPITAL_IS_DEMO=False for Live)."
 
                 self.last_auth_error = err_msg
-                self._auth_backoff_until = time.time() + 180.0  # 3-minute backoff to prevent log flooding and scheduler congestion
+                if "error.too-many.requests" in str(err_msg):
+                    self._auth_backoff_until = time.time() + 20.0
+                    with _GLOBAL_AUTH_LOCK:
+                        _GLOBAL_LAST_AUTH_TS = max(_GLOBAL_LAST_AUTH_TS, time.time() + 15.0)
+                else:
+                    self._auth_backoff_until = time.time() + 180.0  # 3-minute backoff to prevent log flooding and scheduler congestion
                 if not self._auth_error_logged:
                     logger.error(f"Authentication failed: {err_msg}")
                     self._auth_error_logged = True
@@ -744,18 +788,26 @@ class CapitalComEngine:
             return False, f"Connection Exception: {e}"
 
     def ensure_session(self) -> bool:
-        """Verifies session freshness and auto-refreshes if close to 10-minute expiry (Thread-safe)."""
+        """
+        Verifies session freshness (Thread-safe).
+        Capital.com sessions remain valid as long as requests occur within the 10-minute idle window.
+        Only re-authenticates if tokens are absent or idle duration exceeds SESSION_IDLE_TIMEOUT (540s).
+        """
         now = time.time()
-        if self.cst_token and self.security_token and (now - self.session_created_at) <= SESSION_EXPIRY_THRESHOLD:
-            return True
+        if self.cst_token and self.security_token:
+            last_active = self.last_activity_ts or self.session_created_at
+            if (now - last_active) < SESSION_IDLE_TIMEOUT:
+                return True
 
         if now < self._auth_backoff_until:
             return False
 
         with self._session_lock:
             now = time.time()
-            if self.cst_token and self.security_token and (now - self.session_created_at) <= SESSION_EXPIRY_THRESHOLD:
-                return True
+            if self.cst_token and self.security_token:
+                last_active = self.last_activity_ts or self.session_created_at
+                if (now - last_active) < SESSION_IDLE_TIMEOUT:
+                    return True
             if now < self._auth_backoff_until:
                 return False
             success, msg = self.authenticate()
@@ -792,7 +844,7 @@ class CapitalComEngine:
                 }
             }
         now = time.time()
-        if not force_refresh and self._accounts_cache and (now - self._accounts_cache_time) < 4.0:
+        if not force_refresh and self._accounts_cache and (now - self._accounts_cache_time) < 30.0:
             return self._accounts_cache
 
         if not self.ensure_session():
@@ -804,6 +856,7 @@ class CapitalComEngine:
             try:
                 res = self.session.get(url, headers=self.get_auth_headers(), timeout=12)
                 if res.status_code == 200:
+                    self._record_response(res)
                     data = res.json()
                     accounts = data.get("accounts", [])
                     
@@ -812,14 +865,14 @@ class CapitalComEngine:
                     # Priority 0: Match desired_account_id if specified (Invariant 75 Multi-Account Isolation)
                     if self.desired_account_id:
                         for acc in accounts:
-                            if str(acc.get("accountId")) == str(self.desired_account_id):
+                            if str(acc.get("accountId")).strip() == str(self.desired_account_id).strip():
                                 primary = acc
                                 break
 
                     # Priority 1: Match authenticated session account ID (from POST /session currentAccountId)
                     if not primary and self.active_account_id:
                         for acc in accounts:
-                            if str(acc.get("accountId")) == str(self.active_account_id):
+                            if str(acc.get("accountId")).strip() == str(self.active_account_id).strip():
                                 primary = acc
                                 break
                     
@@ -873,11 +926,8 @@ class CapitalComEngine:
                 return {"success": False, "error": f"HTTP {res.status_code}: {res.text}"}
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ConnectionResetError) as ce:
                 if attempt == 0:
-                    time.sleep(0.3)
-                    self.cst_token = None
-                    self.security_token = None
-                    if self.ensure_session():
-                        continue
+                    time.sleep(0.5)
+                    continue
                 return {"success": False, "error": f"Connection error: {ce}"}
             except Exception as e:
                 return {"success": False, "error": str(e)}
@@ -973,16 +1023,25 @@ class CapitalComEngine:
         """
         if getattr(self, "is_guest", False) or not self.ensure_session():
             return False
+        global _GLOBAL_INVALID_SWITCH_ACCOUNTS
+        acc_str = str(account_id or "").strip()
+        if not acc_str or acc_str in _GLOBAL_INVALID_SWITCH_ACCOUNTS:
+            return False
         url = f"{self.base_url}/session"
         try:
-            res = self.session.put(url, headers=self.get_auth_headers(), json={"accountId": str(account_id)}, timeout=8)
+            res = self.session.put(url, headers=self.get_auth_headers(), json={"accountId": acc_str}, timeout=8)
             if res.status_code == 200:
-                self.active_account_id = str(account_id)
+                self._record_response(res)
+                self.active_account_id = acc_str
                 self.invalidate_account_cache()
-                logger.info(f"🔄 [CAPITAL SWITCH] Successfully switched active account to {account_id}")
+                logger.info(f"🔄 [CAPITAL SWITCH] Successfully switched active account to {acc_str}")
                 return True
             else:
-                logger.warning(f"⚠️ [CAPITAL SWITCH] Failed to switch account to {account_id}: HTTP {res.status_code} {res.text}")
+                if "error.invalid.accountId" in res.text:
+                    _GLOBAL_INVALID_SWITCH_ACCOUNTS.add(acc_str)
+                    logger.debug(f"ℹ️ [CAPITAL SWITCH] Account {acc_str} does not belong to active login credentials: HTTP {res.status_code}")
+                else:
+                    logger.warning(f"⚠️ [CAPITAL SWITCH] Failed to switch account to {acc_str}: HTTP {res.status_code} {res.text}")
         except Exception as e:
             logger.debug(f"switch_account exception: {e}")
         return False
@@ -1262,6 +1321,7 @@ class CapitalComEngine:
         try:
             res = self.session.get(url, headers=self.get_auth_headers(), timeout=8)
             if res.status_code == 200:
+                self._record_response(res)
                 data = res.json()
                 snapshot = data.get("snapshot", {})
                 dealing_rules = data.get("dealingRules", {})
@@ -1366,6 +1426,7 @@ class CapitalComEngine:
                     self.authenticate()
                     continue
                 if res.status_code == 200:
+                    self._record_response(res)
                     data = res.json()
                     prices = data.get("prices", [])
                     candles = []
@@ -1402,6 +1463,7 @@ class CapitalComEngine:
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """Retrieves all currently active open positions with automatic connection recovery."""
         if getattr(self, "is_guest", False) or not self.ensure_session():
+            self._last_positions_fetch_failed = True
             return []
 
         url = f"{self.base_url}/positions"
@@ -1409,26 +1471,29 @@ class CapitalComEngine:
             try:
                 res = self.session.get(url, headers=self.get_auth_headers(), timeout=12)
                 if res.status_code == 200:
+                    self._record_response(res)
                     data = res.json()
+                    self._last_positions_fetch_failed = False
                     return data.get("positions", [])
                 elif res.status_code == 401 and attempt == 0:
                     self.cst_token = None
                     self.security_token = None
                     if self.ensure_session():
                         continue
+                self._last_positions_fetch_failed = True
                 return []
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ConnectionResetError) as ce:
                 if attempt == 0:
-                    time.sleep(0.3)
-                    self.cst_token = None
-                    self.security_token = None
-                    if self.ensure_session():
-                        continue
+                    time.sleep(0.5)
+                    continue
                 logger.warning(f"Transient connection glitch fetching open positions ({type(ce).__name__}). Retrying on next cycle.")
+                self._last_positions_fetch_failed = True
                 return []
             except Exception as e:
                 logger.error(f"Error fetching open positions: {e}")
+                self._last_positions_fetch_failed = True
                 return []
+        self._last_positions_fetch_failed = True
         return []
 
     def place_position(
@@ -1450,11 +1515,23 @@ class CapitalComEngine:
         Guarantees cross-engine mutex isolation against concurrent double execution on the same epic.
         """
         resolved_epic = EPIC_MAP.get(str(epic).upper(), str(epic).upper())
-        _acct_id = str(getattr(self, "identifier", "") or getattr(self, "api_key", "") or "")
-        _acct_key = f"{_acct_id}|{'DEMO' if getattr(self, 'is_demo', False) else 'LIVE'}"
+        _user_id = str(
+            getattr(self, "active_account_id", "")
+            or getattr(self, "desired_account_id", "")
+            or getattr(self, "_custom_chat_id", "")
+            or getattr(self, "chat_id", "")
+            or getattr(self, "identifier", "")
+            or getattr(self, "api_key", "")
+            or "DEFAULT"
+        )
+        _mode = "DEMO" if getattr(self, "is_demo", False) else "LIVE"
+        _acct_key = f"{_user_id}|{_mode}"
         asset_lock = _get_asset_lock(resolved_epic, _acct_key)
-        if not asset_lock.acquire(blocking=False):
-            logger.warning(f"🛑 [MUTEX ORDER LOCK] Concurrent order rejected: Another order is in-flight for {resolved_epic} on this account")
+        acquired = asset_lock.acquire(blocking=True, timeout=5.0)
+        if not acquired:
+            logger.warning(
+                f"🛑 [MUTEX ORDER LOCK] Concurrent order rejected: Another order is in-flight for {resolved_epic} on account {_acct_key} (timeout 5.0s)"
+            )
             return {
                 "success": False,
                 "error": f"CONCURRENT_ORDER_LOCK: Another order is currently being executed on {resolved_epic}."
@@ -1548,9 +1625,29 @@ class CapitalComEngine:
                 p.get("epic") or p.get("market", {}).get("epic")
                 for p in open_pos if (p.get("epic") or p.get("market", {}).get("epic"))
             ]
+            
+            # Determine maximum asset capacity for pyramiding / multi-position scaling
+            eff_max_pos = 1
+            if kwargs.get("max_positions"):
+                eff_max_pos = int(kwargs.get("max_positions"))
+            elif kwargs.get("allow_pyramiding"):
+                eff_max_pos = 5
+            elif resolved_epic == "GOLD" or "PYRAMID" in str(kwargs.get("setup_type", "")).upper():
+                try:
+                    import database as db
+                    target_cid = getattr(self, "chat_id", None) or getattr(self, "_custom_chat_id", None)
+                    if target_cid:
+                        u_cfg = db.get_capital_auto_config(target_cid)
+                        eff_max_pos = int(u_cfg.get("max_positions", 5) or 5)
+                    else:
+                        eff_max_pos = 5
+                except Exception:
+                    eff_max_pos = 5
+
             is_corr_ok, corr_reason, corr_diag = portfolio_circuit_breaker.validate_cross_asset_portfolio_exposure(
                 proposed_epic=resolved_epic,
-                open_epics=current_open_epics
+                open_epics=current_open_epics,
+                max_asset_positions=eff_max_pos
             )
             if not is_corr_ok:
                 now_ts = time.time()
@@ -1753,6 +1850,7 @@ class CapitalComEngine:
         try:
             res = self.session.post(url, headers=self.get_auth_headers(), json=payload, timeout=10)
             if res.status_code == 200:
+                self._record_response(res)
                 data = res.json()
                 deal_ref = data.get("dealReference")
                 logger.info(f"Order submitted successfully! Epic: {resolved_epic} | Dir: {dir_upper} | Ref: {deal_ref}")
@@ -1894,6 +1992,7 @@ class CapitalComEngine:
                 time.sleep(delay)
                 res = self.session.get(url, headers=self.get_auth_headers(), timeout=10)
                 if res.status_code == 200:
+                    self._record_response(res)
                     data = res.json()
                     deal_status = str(data.get("dealStatus", "")).upper()
                     status = str(data.get("status", "")).upper()
@@ -1974,6 +2073,7 @@ class CapitalComEngine:
         try:
             res = self.session.delete(url, headers=self.get_auth_headers(), timeout=10)
             if res.status_code == 200:
+                self._record_response(res)
                 data = res.json()
                 deal_ref = data.get("dealReference")
                 logger.info(f"Position {deal_id} closed successfully! Deal Ref: {deal_ref}")
@@ -2167,6 +2267,7 @@ class CapitalComEngine:
         try:
             res = self.session.post(url, headers=self.get_auth_headers(), json=payload, timeout=10)
             if res.status_code == 200:
+                self._record_response(res)
                 data = res.json()
                 deal_ref = data.get("dealReference")
                 logger.info(f"Working order submitted! Epic: {resolved_epic} | Dir: {dir_upper} | Type: {type_upper} | Level: {level} | Ref: {deal_ref}")
@@ -2283,6 +2384,7 @@ class CapitalComEngine:
         try:
             res = self.session.delete(url, headers=self.get_auth_headers(), timeout=10)
             if res.status_code == 200:
+                self._record_response(res)
                 data = res.json()
                 deal_ref = data.get("dealReference")
                 logger.info(f"✅ Working order {deal_id} cancelled! Deal Ref: {deal_ref}")
@@ -2319,6 +2421,7 @@ class CapitalComEngine:
         try:
             res = self.session.put(url, headers=self.get_auth_headers(), json=payload, timeout=10)
             if res.status_code == 200:
+                self._record_response(res)
                 return {"success": True, "deal_id": deal_id, "data": res.json()}
             else:
                 err_data = res.json() if res.content else {}
@@ -2891,6 +2994,20 @@ class CapitalComEngine:
                 "error": "LOCKED: Please connect your personal Capital.com API key via /capital API <Key> <Email> <Password>."
             }
 
+        # Multi-Account Isolation & Failed Switch Shield (AQ88 Invariant 135)
+        # If this engine has a specified desired_account_id, it MUST match the active session account!
+        # If switching failed, placing an order on whatever default account is active is 100% FORBIDDEN.
+        if self.desired_account_id and self.active_account_id:
+            if str(self.active_account_id).strip() != str(self.desired_account_id).strip():
+                logger.error(
+                    f"🚨 [CROSS-ACCOUNT COLLISION BLOCKED] Engine session account {self.active_account_id} "
+                    f"does not match requested user account {self.desired_account_id}! Order rejected to protect account capital."
+                )
+                return {
+                    "success": False,
+                    "error": f"CROSS_ACCOUNT_COLLISION_BLOCKED: Session account {self.active_account_id} != desired {self.desired_account_id}."
+                }
+
         if not self.is_demo and user_cid and not db.is_capital_user_authorized(user_cid):
             return {
                 "success": False,
@@ -3098,6 +3215,10 @@ class CapitalComEngine:
         # Pillar 4: Institutional 3-Stage Multi-Target Scale-Out Plan (TP1 50%, TP2 30%, Runner 20%)
         import super_smart_capital_citadel as sscc
         scale_mgr = sscc.get_tradfi_scale_out_manager()
+        is_gold_epic = "GOLD" in resolved_epic or "XAU" in resolved_epic
+        is_qg_setup = any(x in str(kwargs.get("setup_type", "")).upper() for x in ["QUANT_GOLD", "VIP_1TAP", "POS1_", "POS2_", "POS3_", "POS4_", "POS5_"])
+        is_compact_gold = bool(kwargs.get("single_compact", False)) or (is_gold_epic and (size <= 0.75 or is_qg_setup))
+
         scale_plan = scale_mgr.calculate_scale_out_plan(
             epic=resolved_epic,
             direction=dir_u,
@@ -3111,7 +3232,8 @@ class CapitalComEngine:
             runner_r=10.00,
             tp1_price=analysis.get("tp1"),
             tp2_price=analysis.get("tp2"),
-            tp3_price=analysis.get("tp3")
+            tp3_price=analysis.get("tp3"),
+            single_compact=is_compact_gold
         )
 
         # 4. Transmit Protected Position (Multi-Tranche Scale-Out or Single Dynamic Order)
@@ -3120,6 +3242,22 @@ class CapitalComEngine:
             "NVDA": 0.60, "TSLA": 0.60, "AAPL": 0.50, "MSFT": 0.60, "AMZN": 0.60
         }
         max_spread = max_spreads.get(resolved_epic, 5.0)
+
+        # Forward pyramiding and position settings
+        eff_max_pos = kwargs.get("max_positions")
+        if eff_max_pos is None and (resolved_epic == "GOLD" or "PYRAMID" in str(kwargs.get("setup_type", "")).upper()):
+            try:
+                import database as db
+                target_cid = getattr(self, "chat_id", None) or getattr(self, "_custom_chat_id", None)
+                if target_cid:
+                    u_cfg = db.get_capital_auto_config(target_cid)
+                    eff_max_pos = int(u_cfg.get("max_positions", 5) or 5)
+                else:
+                    eff_max_pos = 5
+            except Exception:
+                eff_max_pos = 5
+        allow_pyr = kwargs.get("allow_pyramiding", True if (eff_max_pos and eff_max_pos > 1) else False)
+        extra_fwd = {k: v for k, v in kwargs.items() if k not in ["max_positions", "allow_pyramiding", "setup_type", "strategy_regime"]}
 
         if scale_plan.get("can_split"):
             tranches_res = []
@@ -3136,7 +3274,10 @@ class CapitalComEngine:
                     max_allowed_spread=max_spread,
                     bypass_citadel=bypass_citadel,
                     setup_type=(analysis.get("trigger_type") or kwargs.get("setup_type", "")),
-                    strategy_regime=(analysis.get("strategy_regime") or kwargs.get("strategy_regime", "AUTO"))
+                    strategy_regime=(analysis.get("strategy_regime") or kwargs.get("strategy_regime", "AUTO")),
+                    max_positions=eff_max_pos,
+                    allow_pyramiding=allow_pyr,
+                    **extra_fwd
                 )
                 if t_res.get("success"):
                     t_res["tranche_id"] = t_id
@@ -3171,7 +3312,10 @@ class CapitalComEngine:
             max_allowed_spread=max_spread,
             bypass_citadel=bypass_citadel,
             setup_type=(analysis.get("trigger_type") or kwargs.get("setup_type", "")),
-            strategy_regime=(analysis.get("strategy_regime") or kwargs.get("strategy_regime", "AUTO"))
+            strategy_regime=(analysis.get("strategy_regime") or kwargs.get("strategy_regime", "AUTO")),
+            max_positions=eff_max_pos,
+            allow_pyramiding=allow_pyr,
+            **extra_fwd
         )
 
         if res.get("success"):
@@ -3312,21 +3456,13 @@ class CapitalComEngine:
 _GLOBAL_CAPITAL_LIVE_ENGINE: Optional[CapitalComEngine] = None
 _GLOBAL_CAPITAL_DEMO_ENGINE: Optional[CapitalComEngine] = None
 _user_engine_pool: Dict[str, CapitalComEngine] = {}
-_pool_lock = threading.Lock()
+_pool_lock = threading.RLock()
 
 def get_capital_engine(is_demo: Optional[bool] = None) -> CapitalComEngine:
     """Singleton getter for the global CapitalComEngine instance (Live or Demo)."""
-    global _GLOBAL_CAPITAL_LIVE_ENGINE, _GLOBAL_CAPITAL_DEMO_ENGINE
     if is_demo is None:
         is_demo = False  # Default to LIVE MAINNET for investments
-    if is_demo:
-        if _GLOBAL_CAPITAL_DEMO_ENGINE is None:
-            _GLOBAL_CAPITAL_DEMO_ENGINE = CapitalComEngine(is_demo=True)
-        return _GLOBAL_CAPITAL_DEMO_ENGINE
-    else:
-        if _GLOBAL_CAPITAL_LIVE_ENGINE is None:
-            _GLOBAL_CAPITAL_LIVE_ENGINE = CapitalComEngine(is_demo=False)
-        return _GLOBAL_CAPITAL_LIVE_ENGINE
+    return get_user_capital_engine(SUPER_ADMIN_ID, is_demo=is_demo)
 
 def get_user_capital_engine(chat_id: int, is_demo: Optional[bool] = None) -> CapitalComEngine:
     """
@@ -3409,7 +3545,44 @@ def get_user_capital_engine(chat_id: int, is_demo: Optional[bool] = None) -> Cap
                     _user_engine_pool[pool_key] = engine
                     return engine
             else:
-                # Sub-account sharing master login credentials (e.g. @chengphol with account 331963468326458564)
+                # Sub-account sharing master login credentials
+                # If target_acc matches Super Admin's account or is empty, reuse the Super Admin engine instance!
+                sa_acc = (
+                    (os.getenv("CAPITAL_DEMO_ACCOUNT_ID") or "329832717876539678").strip()
+                    if is_demo else
+                    (os.getenv("CAPITAL_ACCOUNT_ID") or "216890638652757188").strip()
+                )
+                if not target_acc or target_acc == sa_acc:
+                    # Invariant 135: Forbid non-admin users from executing on Super Admin's live broker account!
+                    if int(chat_id) != SUPER_ADMIN_ID and not is_demo:
+                        logger.warning(
+                            f"🚨 [CAPITAL FIDUCIARY GUARD] Non-admin user {chat_id} attempted to bind to Super Admin live account {sa_acc}! "
+                            f"Preventing unauthorized live order execution & capital spillover."
+                        )
+                        engine = CapitalComEngine(
+                            api_key="UNAUTHENTICATED_GUEST",
+                            identifier="",
+                            password="",
+                            is_demo=False,
+                            custom_chat_id=chat_id
+                        )
+                        _user_engine_pool[pool_key] = engine
+                        return engine
+
+                    sa_pool_key = f"{SUPER_ADMIN_ID}_{'demo' if is_demo else 'live'}"
+                    if sa_pool_key in _user_engine_pool:
+                        sa_engine = _user_engine_pool[sa_pool_key]
+                    else:
+                        sa_engine = CapitalComEngine(
+                            is_demo=is_demo,
+                            custom_chat_id=SUPER_ADMIN_ID,
+                            desired_account_id=sa_acc
+                        )
+                        _user_engine_pool[sa_pool_key] = sa_engine
+                    _user_engine_pool[pool_key] = sa_engine
+                    return sa_engine
+
+                # Distinct sub-account (e.g. @chengphol with account 331963468326458564)
                 engine = CapitalComEngine(
                     is_demo=is_demo,
                     custom_chat_id=chat_id,

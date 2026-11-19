@@ -37,6 +37,29 @@ import pandas as pd
 
 logger = logging.getLogger("QUANT_GOLD_TIMEFRAMES")
 
+_NET_CHECK_CACHE: Tuple[float, bool] = (0.0, False)
+
+def _check_network_online() -> bool:
+    """Fast non-blocking pre-check for network reachability with 10s caching."""
+    global _NET_CHECK_CACHE
+    import os
+    if os.getenv("OFFLINE_MODE", "0") == "1":
+        return False
+    now = time.time()
+    if (now - _NET_CHECK_CACHE[0]) < 10.0:
+        return _NET_CHECK_CACHE[1]
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(('1.1.1.1', 80))
+        s.close()
+        _NET_CHECK_CACHE = (now, True)
+        return True
+    except Exception:
+        _NET_CHECK_CACHE = (now, False)
+        return False
+
 TIMEFRAMES_19 = [
     # 10 Minutes
     "M1", "M2", "M3", "M4", "M5", "M10", "M15", "M20", "M30", "M45",
@@ -123,6 +146,42 @@ class GoldMultiTimeframeEngine:
         self._cache: Dict[str, Any] = {}
         self._cache_ts: float = 0.0
         self._cache_ttl: float = 2.0  # 2-second RAM TTL for sub-millisecond querying
+        self._real_candle_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+
+    def fetch_real_gold_candles(self, resolution: str = "MINUTE_15", max_bars: int = 100) -> Optional[pd.DataFrame]:
+        """
+        Fetches live historical OHLCV candles for Gold from Capital.com broker API.
+        Caches in RAM for 30s to prevent spamming broker API.
+        """
+        if not _check_network_online():
+            return None
+
+        now = time.time()
+        cached = self._real_candle_cache.get(resolution)
+        if cached and (now - cached[0]) < 30.0 and cached[1] is not None and len(cached[1]) >= 10:
+            return cached[1].copy()
+
+        try:
+            import capital_engine
+            c_eng = capital_engine.get_capital_engine()
+            raw_candles = c_eng.get_historical_prices("GOLD", resolution=resolution, max_bars=max_bars)
+            if raw_candles and len(raw_candles) >= 10:
+                df = pd.DataFrame(raw_candles)
+                if "snapshotTime" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["snapshotTime"], errors="coerce")
+                elif "timestamp" not in df.columns:
+                    df["timestamp"] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq="15min")
+                for col in ["open", "high", "low", "close", "volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["close"])
+                if len(df) >= 10:
+                    self._real_candle_cache[resolution] = (now, df)
+                    logger.debug(f"Retrieved {len(df)} real Gold candles from Capital.com ({resolution}).")
+                    return df.copy()
+        except Exception as e:
+            logger.debug(f"Could not fetch real Gold candles ({resolution}): {e}")
+        return None
 
     def build_synthetic_gold_candles(self, base_price: float = 4095.0, count: int = 300) -> pd.DataFrame:
         """
@@ -169,7 +228,7 @@ class GoldMultiTimeframeEngine:
         })
         return df
 
-    def compute_timeframe_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def compute_timeframe_indicators(self, df: pd.DataFrame, tf_name: str = "M15") -> Dict[str, Any]:
         """
         Computes 360° Technical, Volatility, SMC, and Pattern features for a single timeframe.
         """
@@ -236,6 +295,34 @@ class GoldMultiTimeframeEngine:
                 trs.append(tr)
             atr = float(np.mean(trs)) if trs else 1.50
 
+        # 3.5. ADX(14) & Directional Movement Index (+DI, -DI)
+        adx = 20.0
+        plus_di = 20.0
+        minus_di = 20.0
+        if n >= 15:
+            plus_dms = []
+            minus_dms = []
+            tr_list = []
+            for i in range(n - 14, n):
+                up_move = highs[i] - highs[i - 1]
+                down_move = lows[i - 1] - lows[i]
+                plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+                minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+                tr = max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i - 1]),
+                    abs(lows[i] - closes[i - 1])
+                )
+                plus_dms.append(plus_dm)
+                minus_dms.append(minus_dm)
+                tr_list.append(tr)
+            tr_sum = max(0.01, sum(tr_list))
+            plus_di = round((sum(plus_dms) / tr_sum) * 100.0, 1)
+            minus_di = round((sum(minus_dms) / tr_sum) * 100.0, 1)
+            di_sum = plus_di + minus_di
+            dx = (abs(plus_di - minus_di) / max(0.01, di_sum)) * 100.0
+            adx = round(dx, 1)
+
         # 4. Bollinger Bands (20, 2.0)
         window = min(20, n)
         sma20 = float(np.mean(closes[-window:]))
@@ -275,25 +362,42 @@ class GoldMultiTimeframeEngine:
             elif lows[-1] < prior_low and closes[-1] > prior_low:
                 sweep_type = "BULLISH_SWEEP"
 
-        # 8. Candlestick Pattern Detection
+        # 8. Candlestick Pattern Detection (Augmented with 10-Year RAM Pattern Memory)
         pattern = "NONE"
-        c_body = abs(closes[-1] - opens[-1])
-        c_range = max(0.001, highs[-1] - lows[-1])
-        lower_wick = min(opens[-1], closes[-1]) - lows[-1]
-        upper_wick = highs[-1] - max(opens[-1], closes[-1])
+        pattern_wr = 50.0
+        pattern_pf = 1.0
 
-        # Pinbar / Hammer
-        if lower_wick >= 2.0 * c_body and upper_wick <= 0.5 * c_body:
-            pattern = "BULLISH_PINBAR_HAMMER"
-        elif upper_wick >= 2.0 * c_body and lower_wick <= 0.5 * c_body:
-            pattern = "BEARISH_PINBAR_STAR"
-        # Engulfing
-        elif n >= 2:
-            prev_body = abs(closes[-2] - opens[-2])
-            if closes[-1] > opens[-1] and closes[-2] < opens[-2] and closes[-1] >= opens[-2] and opens[-1] <= closes[-2]:
-                pattern = "BULLISH_ENGULFING"
-            elif closes[-1] < opens[-1] and closes[-2] > opens[-2] and closes[-1] <= opens[-2] and opens[-1] >= closes[-2]:
-                pattern = "BEARISH_ENGULFING"
+        # Try 10-Year Institutional RAM Pattern Memory Engine (Nanosecond speed on supported timeframes)
+        if tf_name.upper() in ["M15", "M30", "H1", "H4", "D1"]:
+            try:
+                from gold_candlestick_pattern_memory import detect_live_gold_candlestick_patterns
+                ram_res = detect_live_gold_candlestick_patterns(df, timeframe=tf_name, current_price=curr_p)
+                if ram_res.get("has_pattern"):
+                    pattern = str(ram_res.get("highest_conviction_pattern") or "NONE")
+                    pattern_wr = float(ram_res.get("win_rate_confluence", 75.0) or 75.0)
+                    pattern_pf = float(ram_res.get("profit_factor", 1.8) or 1.8)
+            except Exception:
+                pass
+
+        # Fallback to local heuristic detection if RAM pattern engine returned NONE
+        if pattern == "NONE":
+            c_body = abs(closes[-1] - opens[-1])
+            c_range = max(0.001, highs[-1] - lows[-1])
+            lower_wick = min(opens[-1], closes[-1]) - lows[-1]
+            upper_wick = highs[-1] - max(opens[-1], closes[-1])
+
+            # Pinbar / Hammer
+            if lower_wick >= 2.0 * c_body and upper_wick <= 0.5 * c_body:
+                pattern = "BULLISH_PINBAR_HAMMER"
+            elif upper_wick >= 2.0 * c_body and lower_wick <= 0.5 * c_body:
+                pattern = "BEARISH_PINBAR_STAR"
+            # Engulfing
+            elif n >= 2:
+                prev_body = abs(closes[-2] - opens[-2])
+                if closes[-1] > opens[-1] and closes[-2] < opens[-2] and closes[-1] >= opens[-2] and opens[-1] <= closes[-2]:
+                    pattern = "BULLISH_ENGULFING"
+                elif closes[-1] < opens[-1] and closes[-2] > opens[-2] and closes[-1] <= opens[-2] and opens[-1] >= closes[-2]:
+                    pattern = "BEARISH_ENGULFING"
 
         # 9. Compute Directional Score (-100 to +100)
         score = 0.0
@@ -315,17 +419,31 @@ class GoldMultiTimeframeEngine:
         else:
             score -= 15.0
 
-        # Momentum RSI
-        if 50.0 < rsi <= 68.0:
-            score += 15.0
-        elif 38.0 <= rsi < 50.0:
-            score -= 15.0
-        elif rsi > 70.0:
-            # Overbought warning: penalize chasing longs
-            score -= 10.0
-        elif rsi < 36.0:
-            # Oversold warning: penalize chasing shorts
-            score += 10.0
+        # ADX Trend Strength & Directional Regimes (AQ88 Invariant 123)
+        is_strong_trend = (adx >= 25.0)
+        is_strong_bear_trend = is_strong_trend and (minus_di > plus_di)
+        is_strong_bull_trend = is_strong_trend and (plus_di > minus_di)
+
+        if is_strong_bear_trend:
+            score -= 20.0
+            # In a strong bear trend, low RSI is pure downward momentum, NOT a buy signal!
+            if rsi < 36.0:
+                score -= 10.0
+        elif is_strong_bull_trend:
+            score += 20.0
+            # In a strong bull trend, high RSI is pure upward momentum, NOT a sell signal!
+            if rsi > 70.0:
+                score += 10.0
+        else:
+            # Ranging / Consolidation Market: Mean-reverting RSI
+            if 50.0 < rsi <= 68.0:
+                score += 15.0
+            elif 38.0 <= rsi < 50.0:
+                score -= 15.0
+            elif rsi > 70.0:
+                score -= 10.0
+            elif rsi < 36.0:
+                score += 10.0
 
         # SMC FVG & Sweep Boost
         if sweep_type == "BULLISH_SWEEP":
@@ -338,11 +456,32 @@ class GoldMultiTimeframeEngine:
         elif fvg_type == "BEARISH_FVG":
             score -= 15.0
 
-        # Candlestick Pattern Boost
-        if "BULLISH" in pattern:
-            score += 20.0
-        elif "BEARISH" in pattern:
-            score -= 20.0
+        # Candlestick Pattern Boost (Calibrated with Empirical Confluence Win Rate)
+        if "BULLISH" in pattern or "HAMMER" in pattern or "WHITE_SOLDIERS" in pattern or "MORNING_STAR" in pattern or "TWEEZER_BOTTOM" in pattern:
+            boost = 25.0 if pattern_wr >= 80.0 else 20.0
+            score += boost
+        elif "BEARISH" in pattern or "STAR" in pattern or "BLACK_CROWS" in pattern or "EVENING_STAR" in pattern or "TWEEZER_TOP" in pattern or "DARK_CLOUD" in pattern:
+            boost = 25.0 if pattern_wr >= 80.0 else 20.0
+            score -= boost
+
+        # 8.5. TradingView Geometric & Channel Confluence (OLS Regression & Fib Golden Pocket)
+        ols_z = 0.0
+        in_fib_pocket = False
+        try:
+            from tradingview_confluence_matrix import compute_ols_regression_channel, compute_fibonacci_matrix
+            ols_data = compute_ols_regression_channel(closes[-min(40, n):], k=2.0)
+            ols_z = float(ols_data.get("z_score", 0.0) or 0.0)
+            if ols_z <= -1.80:
+                score += 15.0  # Statistical mean-reversion buy
+            elif ols_z >= 1.80:
+                score -= 15.0  # Statistical mean-reversion sell
+
+            fib_data = compute_fibonacci_matrix(range_low, range_high)
+            if fib_data["golden_pocket_low"] <= curr_p <= fib_data["golden_pocket_high"]:
+                in_fib_pocket = True
+                score += 10.0 if score >= 0 else -10.0
+        except Exception:
+            pass
 
         # Equilibrium Chop Dampener: If in middle chop, scale score towards 0
         if is_chop_zone:
@@ -356,6 +495,11 @@ class GoldMultiTimeframeEngine:
             "bias": bias,
             "rsi": round(rsi, 1),
             "atr": round(atr, 2),
+            "adx": round(adx, 1),
+            "plus_di": round(plus_di, 1),
+            "minus_di": round(minus_di, 1),
+            "is_strong_bear_trend": is_strong_bear_trend,
+            "is_strong_bull_trend": is_strong_bull_trend,
             "close": round(curr_p, 2),
             "ema9": round(ema9, 2),
             "ema21": round(ema21, 2),
@@ -370,7 +514,9 @@ class GoldMultiTimeframeEngine:
                 "range_high": round(range_high, 2),
                 "range_low": round(range_low, 2),
                 "range_pct": round(range_pct, 2),
-                "chop_zone": is_chop_zone
+                "chop_zone": is_chop_zone,
+                "ols_z_score": round(ols_z, 2),
+                "in_fib_pocket": in_fib_pocket
             },
             "pattern": pattern
         }
@@ -394,12 +540,35 @@ class GoldMultiTimeframeEngine:
         if (now - self._cache_ts) < self._cache_ttl and self._cache:
             return self._cache
 
+        # Priority 1: Fetch REAL candles directly from Capital.com broker API
+        real_m15 = self.fetch_real_gold_candles(resolution="MINUTE_15", max_bars=100)
+        real_h1 = self.fetch_real_gold_candles(resolution="HOUR", max_bars=80)
+        real_d1 = self.fetch_real_gold_candles(resolution="DAY", max_bars=30)
+        real_m5 = self.fetch_real_gold_candles(resolution="MINUTE_5", max_bars=120)
+
         # Ensure base data
-        if base_m1_df is None or len(base_m1_df) < 60:
+        if base_m1_df is None or len(base_m1_df) < 30:
+            if real_m5 is not None and len(real_m5) >= 30:
+                base_m1_df = real_m5
+            else:
+                real_m1 = self.fetch_real_gold_candles(resolution="MINUTE", max_bars=120)
+                if real_m1 is not None and len(real_m1) >= 30:
+                    base_m1_df = real_m1
+
+        if base_h1_df is None or len(base_h1_df) < 10:
+            if real_h1 is not None and len(real_h1) >= 10:
+                base_h1_df = real_h1
+
+        if base_d1_df is None or len(base_d1_df) < 5:
+            if real_d1 is not None and len(real_d1) >= 5:
+                base_d1_df = real_d1
+
+        # Priority 2: Graceful offline fallback to synthetic ONLY if broker returned no candles
+        if base_m1_df is None or len(base_m1_df) < 30:
             base_m1_df = self.build_synthetic_gold_candles(base_price=current_price, count=360)
-        if base_h1_df is None or len(base_h1_df) < 24:
+        if base_h1_df is None or len(base_h1_df) < 10:
             base_h1_df = resample_ohlcv(base_m1_df, target_mins=60)
-        if base_d1_df is None or len(base_d1_df) < 10:
+        if base_d1_df is None or len(base_d1_df) < 5:
             base_d1_df = resample_ohlcv(base_h1_df, target_mins=24)
 
         timeframe_dfs: Dict[str, pd.DataFrame] = {}
@@ -409,9 +578,9 @@ class GoldMultiTimeframeEngine:
         timeframe_dfs["M2"] = resample_ohlcv(base_m1_df, target_mins=2)
         timeframe_dfs["M3"] = resample_ohlcv(base_m1_df, target_mins=3)
         timeframe_dfs["M4"] = resample_ohlcv(base_m1_df, target_mins=4)
-        timeframe_dfs["M5"] = resample_ohlcv(base_m1_df, target_mins=5)
+        timeframe_dfs["M5"] = real_m5 if (real_m5 is not None and len(real_m5) >= 20) else resample_ohlcv(base_m1_df, target_mins=5)
         timeframe_dfs["M10"] = resample_ohlcv(base_m1_df, target_mins=10)
-        timeframe_dfs["M15"] = resample_ohlcv(base_m1_df, target_mins=15)
+        timeframe_dfs["M15"] = real_m15 if (real_m15 is not None and len(real_m15) >= 15) else resample_ohlcv(base_m1_df, target_mins=15)
         timeframe_dfs["M20"] = resample_ohlcv(base_m1_df, target_mins=20)
         timeframe_dfs["M30"] = resample_ohlcv(base_m1_df, target_mins=30)
         timeframe_dfs["M45"] = resample_ohlcv(base_m1_df, target_mins=45)
@@ -428,6 +597,19 @@ class GoldMultiTimeframeEngine:
         timeframe_dfs["D1"] = base_d1_df
         timeframe_dfs["W1"] = resample_ohlcv(base_d1_df, target_mins=7)
         timeframe_dfs["MN"] = resample_ohlcv(base_d1_df, target_mins=30)
+
+        # Update last candle close with live real-time tick price
+        if current_price and current_price >= 3500.0:
+            for tf_name, tf_df in timeframe_dfs.items():
+                if tf_df is not None and len(tf_df) > 0:
+                    try:
+                        tf_df.iloc[-1, tf_df.columns.get_loc("close")] = float(current_price)
+                        if float(current_price) > float(tf_df.iloc[-1]["high"]):
+                            tf_df.iloc[-1, tf_df.columns.get_loc("high")] = float(current_price)
+                        if float(current_price) < float(tf_df.iloc[-1]["low"]):
+                            tf_df.iloc[-1, tf_df.columns.get_loc("low")] = float(current_price)
+                    except Exception:
+                        pass
         self._last_timeframe_dfs = timeframe_dfs
 
         # Calculate metrics per timeframe
@@ -439,7 +621,7 @@ class GoldMultiTimeframeEngine:
 
         for tf in TIMEFRAMES_19:
             df_tf = timeframe_dfs.get(tf)
-            analysis = self.compute_timeframe_indicators(df_tf)
+            analysis = self.compute_timeframe_indicators(df_tf, tf_name=tf)
             tf_results[tf] = analysis
             w = TIMEFRAME_WEIGHTS.get(tf, 1.0 / 19.0)
             weighted_score += analysis["score"] * w
@@ -472,13 +654,40 @@ class GoldMultiTimeframeEngine:
 
         # Overall recommendation
         action = "HOLD"
-        # High-Probability Confluence Entry (Calibrated Institutional Alpha):
-        # Require weighted_score >= 25.0 (or <= -25.0), at least 9/19 timeframes aligned, and win_prob >= 62.0%
-        # Macro check: must not directly oppose a severe macro counter-trend
-        macro_opposed = (macro_score < -25.0 and dom_dir == "BUY") or (macro_score > 25.0 and dom_dir == "SELL")
-        if weighted_score >= 25.0 and bullish_count >= 9 and win_prob >= 62.0 and not macro_opposed:
+        # Calibrated Institutional Alpha & Decoupled Dual-Engine Agility (AQ84 Invariant 95 & 100):
+        # Micro/Intermediate Momentum Impulse check: when micro/inter timeframes (M1-M30)
+        # show strong unified velocity (e.g. abs(micro_score) >= 28.0), do NOT let slow macro D1/W1 lag veto the trade.
+        has_micro_impulse = abs(micro_score) >= 28.0 or abs(inter_score) >= 20.0
+        severe_macro_block = (macro_score < -35.0 and dom_dir == "BUY") or (macro_score > 35.0 and dom_dir == "SELL")
+        macro_veto = severe_macro_block and not has_micro_impulse
+
+        # Buy Condition:
+        # Condition A: Standard high confluence (score >= 20.0, >= 7 bullish, win_prob >= 58%)
+        # Condition B: Overwhelming majority (bullish >= 9, or bullish >= 7 and bearish <= 2)
+        # Condition C: Micro impulse breakout (micro_score >= 28.0, score >= 12.0)
+        # Condition D: Super high score (score >= 30.0)
+        is_buy_confluence = (
+            (weighted_score >= 20.0 and bullish_count >= 7 and win_prob >= 58.0 and not macro_veto) or
+            (bullish_count >= 9 and bullish_count >= (bearish_count * 2) and win_prob >= 60.0 and not macro_veto) or
+            (has_micro_impulse and micro_score >= 28.0 and weighted_score >= 12.0 and not macro_veto) or
+            (weighted_score >= 30.0 and not macro_veto)
+        )
+
+        # Sell Condition:
+        # Condition A: Standard high confluence (score <= -20.0, >= 7 bearish, win_prob >= 58%)
+        # Condition B: Overwhelming majority (bearish >= 9, or bearish >= 7 and bullish <= 2)
+        # Condition C: Micro impulse breakdown (micro_score <= -28.0, score <= -12.0)
+        # Condition D: Super high score (score <= -30.0)
+        is_sell_confluence = (
+            (weighted_score <= -20.0 and bearish_count >= 7 and win_prob >= 58.0 and not macro_veto) or
+            (bearish_count >= 9 and bearish_count >= (bullish_count * 2) and win_prob >= 60.0 and not macro_veto) or
+            (has_micro_impulse and micro_score <= -28.0 and weighted_score <= -12.0 and not macro_veto) or
+            (weighted_score <= -30.0 and not macro_veto)
+        )
+
+        if is_buy_confluence and not is_sell_confluence:
             action = "BUY"
-        elif weighted_score <= -25.0 and bearish_count >= 9 and win_prob >= 62.0 and not macro_opposed:
+        elif is_sell_confluence and not is_buy_confluence:
             action = "SELL"
 
         result = {
@@ -511,6 +720,72 @@ class GoldMultiTimeframeEngine:
         if hasattr(self, "_last_timeframe_dfs") and self._last_timeframe_dfs:
             return self._last_timeframe_dfs.get(tf.upper())
         return None
+
+    def extract_multi_timeframe_liquidity_bounds(
+        self,
+        current_price: float,
+        spread: float = 0.50
+    ) -> Dict[str, Any]:
+        """
+        Super Smart Auto-Dynamic Multi-Timeframe Liquidity Stop Loss Extractor (M1 to Month 1):
+        Scans structural swing wicks, Sell-Side Liquidity (SSL) pools, Buy-Side Liquidity (BSL) pools,
+        and Order Block bases across multi-timeframe spectra to locate the safest structural invalidation levels.
+        Eradicates fixed static points (5.0 or 6.0 pts) and provides dynamic volatility breathing room.
+        """
+        atr_15m = 6.50
+        if hasattr(self, "_cache") and isinstance(self._cache, dict):
+            tf_data = self._cache.get("timeframes", {})
+            m15_info = tf_data.get("M15", {})
+            atr_15m = float(m15_info.get("atr", 6.50) or 6.50)
+
+        # Gather swing highs and lows across cached timeframes
+        swing_lows_below = []
+        swing_highs_above = []
+
+        if hasattr(self, "_last_timeframe_dfs") and isinstance(self._last_timeframe_dfs, dict):
+            for tf_key, df in self._last_timeframe_dfs.items():
+                if df is not None and len(df) >= 5 and "low" in df.columns and "high" in df.columns:
+                    n_check = min(15, len(df))
+                    recent_lows = df["low"].iloc[-n_check:].values
+                    recent_highs = df["high"].iloc[-n_check:].values
+                    for l_val in recent_lows:
+                        if 1.0 < (current_price - l_val) <= (atr_15m * 2.2):
+                            swing_lows_below.append(float(l_val))
+                    for h_val in recent_highs:
+                        if 1.0 < (h_val - current_price) <= (atr_15m * 2.2):
+                            swing_highs_above.append(float(h_val))
+
+        vol_buffer = max(spread * 3.5, atr_15m * 0.25, 1.80)
+
+        # Structural Floor for BUY
+        if swing_lows_below:
+            structural_floor = min(swing_lows_below)
+            raw_sl_buy = structural_floor - vol_buffer
+        else:
+            raw_sl_buy = current_price - max(5.00, atr_15m * 0.85)
+
+        sl_dist_buy = max(4.50, min(14.00, current_price - raw_sl_buy))
+        final_sl_buy = round(current_price - sl_dist_buy, 2)
+
+        # Structural Ceiling for SELL
+        if swing_highs_above:
+            structural_ceiling = max(swing_highs_above)
+            raw_sl_sell = structural_ceiling + vol_buffer
+        else:
+            raw_sl_sell = current_price + max(5.00, atr_15m * 0.85)
+
+        sl_dist_sell = max(4.50, min(14.00, raw_sl_sell - current_price))
+        final_sl_sell = round(current_price + sl_dist_sell, 2)
+
+        return {
+            "sl_buy": final_sl_buy,
+            "sl_dist_buy": round(sl_dist_buy, 2),
+            "sl_sell": final_sl_sell,
+            "sl_dist_sell": round(sl_dist_sell, 2),
+            "atr_15m": round(atr_15m, 2),
+            "spread": round(spread, 2),
+            "vol_buffer": round(vol_buffer, 2)
+        }
 
 
 # Singleton

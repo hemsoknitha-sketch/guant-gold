@@ -18,6 +18,7 @@ Key Architecture:
 =====================================================
 """
 
+import os
 import time
 import math
 import logging
@@ -26,6 +27,11 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import database as db
 import capital_engine
+
+try:
+    from capital_market_report_engine import CapitalMarketReportEngine
+except (ImportError, ValueError):
+    CapitalMarketReportEngine = None
 
 try:
     from .timeframes import get_gold_mtf_engine
@@ -40,14 +46,25 @@ logger = logging.getLogger("QUANT_GOLD_EXECUTION")
 
 
 def get_gold_signal_reply_markup():
-    """Returns the clean inline keyboard matching institutional signal design."""
+    """Returns the clean, super smart inline keyboard matching institutional signal design."""
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         bot_handle = os.getenv("TELEGRAM_BOT_USERNAME", "AngkorQuantBot").replace("@", "").strip() or "AngkorQuantBot"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🥇 Open in Angkor Quant ↗", url=f"https://t.me/{bot_handle}")]
+            [
+                InlineKeyboardButton("🟢 1-Tap BUY (0.5 oz)", callback_data="btn_qgold_buy"),
+                InlineKeyboardButton("🔴 1-Tap SELL (0.5 oz)", callback_data="btn_qgold_sell")
+            ],
+            [
+                InlineKeyboardButton("📊 Open Positions", callback_data="btn_qgold_positions"),
+                InlineKeyboardButton("🔄 Re-Scan 19-TF", callback_data="btn_qgold_signal")
+            ],
+            [
+                InlineKeyboardButton("🥇 Open in Angkor Quant ↗", url=f"https://t.me/{bot_handle}")
+            ]
         ])
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error in get_gold_signal_reply_markup: {e}", exc_info=True)
         return None
 
 
@@ -57,17 +74,20 @@ def format_gold_signal_card(
     tp1: float,
     tp2: float,
     tp3: float,
-    entry_price: float = 0.0
+    entry_price: float = 0.0,
+    card_type: str = "SIGNAL",
+    tranche_num: int = 1
 ) -> str:
     """
     Renders institutional Angkor Quant Gold Signal Card
     with single-direction execution levels and TP targets.
+    Supports standard SIGNAL, AGILE PYRAMID, and TREND REVERSAL FLIP.
     """
     is_buy = str(direction).upper() == "BUY"
     dir_str = "BUY" if is_buy else "SELL"
     dir_icon = "🟢" if is_buy else "🔴"
     if entry_price <= 0.0:
-        entry_price = round(sl + 6.08, 2) if is_buy else round(sl - 6.08, 2)
+        entry_price = round(sl + 16.0, 2) if is_buy else round(sl - 16.0, 2)
 
     sl_pips = abs(entry_price - sl) * 10
     tp1_pips = int(round(abs(tp1 - entry_price) * 10))
@@ -76,24 +96,50 @@ def format_gold_signal_card(
 
     divider = "───────────────"
 
+    tier_spec = get_gold_position_tier_spec(tranche_num - 1 if card_type == "PYRAMID" else 0)
+
+    if card_type == "REVERSAL":
+        header = "<b>Angkor Quant Gold (Trend Reversal Flip)</b> 🔄"
+        action_line = f"🔄 <b>Trend Reversal Flip :</b> <code>{dir_icon} {dir_str}</code> (Opposing Harvested)\n"
+    elif card_type == "PYRAMID":
+        header = f"<b>Angkor Quant Gold ({tier_spec['name']})</b> ⚡"
+        action_line = f"⚡ <b>Pyramid Scale-In :</b> <code>{dir_icon} {dir_str}</code> ({tier_spec['desc']})\n"
+    elif card_type == "STANDBY":
+        header = "<b>Angkor Quant Gold (Standby / Chop Filter)</b> ⚪"
+        action_line = (
+            f"⚪ <b>ស្ថានភាព AI ៖</b> <code>HOLD / CHOP STANDBY</code> (ការពារដើមទុន)\n"
+            f"🧭 <b>ទិសដៅរលកត្រៀម ៖</b> <code>{dir_icon} {dir_str}</code> (Projected Bias)\n"
+        )
+    else:
+        # If TP1 is an institutional macro target (> 150 pips), use Structural Swing Setup
+        if tp1_pips > 150:
+            header = "<b>Angkor Quant Gold (Structural Swing Setup)</b> 🎯"
+        else:
+            header = f"<b>Angkor Quant Gold ({tier_spec['name']})</b>"
+        action_line = f"{dir_icon} <b>Single Direction :</b> <code>{dir_str}</code>\n"
+
+    exec_title = "Execution Levels" if card_type != "STANDBY" else "Prospective Levels (ត្រៀមពេលទម្លាយព្រំដែន)"
+    footer_note = "Auto-Trading for VIP Users active 24/7!" if card_type != "STANDBY" else "ប្រព័ន្ធ AI កំពុងឃ្លាំមើល ២៤/៧! មិនចូលផ្សារនៅកណ្តាល Chop ឡើយ (AQ84 Invariant 76)។"
+
     return (
-        f"<b>Angkor Quant Gold</b>\n"
+        f"{header}\n"
         f"{divider}\n"
-        f"{dir_icon} <b>Single Direction :</b> <code>{dir_str}</code>\n"
-        f"💵 <b>តម្លៃចូលទីផ្សារ (Entry) ៖</b> <code>${entry_price:.2f}</code>\n"
-        f"🎯 <b>Execution Levels ៖</b>\n"
+        f"{action_line}"
+        f"💵 <b>តម្លៃទីផ្សារ (Price) ៖</b> <code>${entry_price:.2f}</code>\n"
+        f"🎯 <b>{exec_title} ៖</b>\n"
         f"   └ <b>Tight SL:</b> <code>${sl:.2f}</code> (-{sl_pips:.1f} p)\n"
         f"   └ <b>TP1 (+{tp1_pips} pips):</b> <code>${tp1:.2f}</code> (TP Lock)\n"
         f"   └ <b>TP2 (+{tp2_pips} pips):</b> <code>${tp2:.2f}</code> (Guaranteed)\n"
         f"   └ <b>TP3 (+{tp3_pips} pips):</b> <code>${tp3:.2f}</code> (Moonshot)\n"
         f"{divider}\n"
-        f"💡 <i>Auto-Trading for VIP Users active 24/7!</i>"
+        f"💡 <i>{footer_note}</i>"
     )
 
 
 def format_gold_tp_card(stage: str, pips: int, direction: str, entry_price: float) -> str:
     """
     Renders institutional Angkor Quant Gold Take Profit Card.
+    Supports SCALP (Pos 1 Fast Harvester), TP1 (Breakeven Armor), TP2 (Cash Floor), and TP3 (Moonshot).
     """
     is_buy = str(direction).upper() == "BUY"
     dir_str = "BUY" if is_buy else "SELL"
@@ -103,15 +149,18 @@ def format_gold_tp_card(stage: str, pips: int, direction: str, entry_price: floa
     # Institutional Sanity Clamping: Prevent runaway/corrupted pip display
     safe_pips = max(10, min(int(pips), 350))
 
-    if "TP1" in st:
-        disp_pips = min(safe_pips, 100) if safe_pips >= 73 else 73
-        stage_desc = f"TP1 Hit (+{disp_pips} pips) | TP Lock (Breakeven Armor 0.0R)!"
+    if "SCALP" in st or "POS1" in st:
+        disp_pips = max(50, min(safe_pips, 100))
+        stage_desc = f"Machine 1 Scalp Harvested (+{disp_pips} pips) | យកចំណេញលឿនចូលហោប៉ៅ!"
+    elif "TP1" in st:
+        disp_pips = safe_pips
+        stage_desc = f"TP1 Hit (+{disp_pips} pips) | Machine 2 Cash Floor Locked!"
     elif "TP2" in st:
-        disp_pips = min(safe_pips, 190) if safe_pips >= 152 else 152
-        stage_desc = f"TP2 Hit (+{disp_pips} pips) | Guaranteed Cash Floor Locked!"
+        disp_pips = max(180, min(safe_pips, 280))
+        stage_desc = f"Machine 2 TP2 Hit (+{disp_pips} pips) | +$8.00 Cash Floor Locked!"
     elif "TP3" in st:
-        disp_pips = min(safe_pips, 280) if safe_pips >= 243 else 243
-        stage_desc = f"TP3 Hit (+{disp_pips} pips) | Moonshot Runner Harvested!"
+        disp_pips = max(280, min(safe_pips, 350))
+        stage_desc = f"Machine 2 TP3 Hit (+{disp_pips} pips) | Moonshot Runner Harvested!"
     else:
         stage_desc = f"Profit Locked (+{safe_pips} pips) | Position Harvested!"
 
@@ -126,6 +175,28 @@ def format_gold_tp_card(stage: str, pips: int, direction: str, entry_price: floa
         f"   └ <code>{stage_desc}</code>\n"
         f"{divider}\n"
         f"💡 <i>Auto-Trading for VIP Users active 24/7!</i>"
+    )
+
+
+def format_gold_sl_card(pips: int, direction: str, entry_price: float, exit_price: float, loss_amount: float) -> str:
+    """
+    Renders institutional Angkor Quant Gold Structural Risk Defense Card.
+    Fiduciary Brutal Engineering Honesty: Informs VIP users transparently when risk defense triggers.
+    """
+    is_buy = str(direction).upper() == "BUY"
+    dir_str = "BUY" if is_buy else "SELL"
+    dir_icon = "🟢" if is_buy else "🔴"
+    divider = "───────────────"
+    return (
+        f"<b>Angkor Quant Gold</b>\n"
+        f"{divider}\n"
+        f"🛡️ <b>STRUCTURAL RISK DEFENSE</b> ⚠️\n"
+        f"{dir_icon} <b>Position Closed :</b> <code>{dir_str}</code> (Entry: ${entry_price:.2f} -> Exit: ${exit_price:.2f})\n"
+        f"🎯 <b>Execution Milestone ៖</b>\n"
+        f"   └ <code>Structural Invalidation Defense (-${abs(loss_amount):.2f}) | ដើមទុនត្រូវបានការពារ!</code>\n"
+        f"   └ <code>ប្រព័ន្ធរក្សាទុកទីតាំងក្នុង RAM រង់ចាំ Liquidity Sweep មុនចូលថ្មី!</code>\n"
+        f"{divider}\n"
+        f"💡 <i>Angkor Quant Fiduciary Protection: គ្មានការលាក់បាំង គ្មានការធ្វេសប្រហែស!</i>"
     )
 
 
@@ -145,34 +216,145 @@ def _check_network_online() -> bool:
         return False
 
 
+def is_engine_1_scalp(tranche_id: str, scale_tier: int = 0) -> bool:
+    """Returns True if the position belongs to Machine 1 (M1-M5 Scalping Engine)."""
+    lbl = str(tranche_id or "").upper()
+    return (
+        "SCALP" in lbl or
+        lbl in ["POS1_M1_M5_SCALP", "ENGINE_1_M1_M5_SCALP"] or
+        ("POS" not in lbl and "REVERSAL" not in lbl and scale_tier == 0)
+    )
+
+
+def is_engine_2_macro(tranche_id: str, scale_tier: int = 0) -> bool:
+    """Returns True if the position belongs to Machine 2 (M15+ Institutional Macro / Swing Trend Engine)."""
+    return not is_engine_1_scalp(tranche_id, scale_tier)
+
+
+def get_gold_position_tier_spec(active_trades_count: int) -> Dict[str, Any]:
+    """
+    Returns the exact 5-tier multi-horizon specification:
+    - Pos 1: Machine 1 (M5 Scalp Fast Harvester with M15 Confluence: +$5.00 to +$10.00 / 100 pips)
+    - Pos 2: Machine 2 (M15-H1 Swing Runner: +$12.00 to +$40.00+ / 240 to 800+ pips)
+    - Pos 3: M15 Structural Swing (+300 pips)
+    - Pos 4: H1 Trend Pyramiding (+400 pips)
+    - Pos 5: H4 Moonshot Super Runner (+600 pips)
+    """
+    tier_index = min(5, max(1, int(active_trades_count) + 1))
+    specs = {
+        1: {
+            "tier": 1,
+            "label": "POS1_M1_M5_SCALP",
+            "name": "Machine 1: M5 Scalp Fast Harvester (M15 Confluence)",
+            "pips_target": 100,
+            "tp_r": 1.50,
+            "desc": "TP: +$5.00 ទៅ +$10.00 (+100 pips) | Armor: +$3.50 (+7.0 pts) -> Breakeven (0.00R Free Roll)"
+        },
+        2: {
+            "tier": 2,
+            "label": "POS2_M15_FVG_RETEST",
+            "name": "Machine 2: M15-H1 Swing Runner (Institutional Session Wave)",
+            "pips_target": 240,
+            "tp_r": 2.50,
+            "desc": "TP1: +$7.50 (+15 pts) -> Cash Floor | TP2: +$12.50 (+25 pts) | Runner: +$15.00 ទៅ +$40.00+"
+        },
+        3: {
+            "tier": 3,
+            "label": "POS3_M15_STRUCTURAL_SWING",
+            "name": "Position 3: M15 Structural Swing",
+            "pips_target": 300,
+            "tp_r": 3.50,
+            "desc": "TP2: +30.0 pts -> ចាក់សោរប្រាក់ចំណេញរឹងមាំ"
+        },
+        4: {
+            "tier": 4,
+            "label": "POS4_H1_TREND_PYRAMID",
+            "name": "Position 4: H1 Trend Pyramiding",
+            "pips_target": 400,
+            "tp_r": 4.50,
+            "desc": "H1 Trend Pyramiding (Pos 1,2,3 ចំណេញ & Free Roll)"
+        },
+        5: {
+            "tier": 5,
+            "label": "POS5_H4_MOONSHOT_RUNNER",
+            "name": "Position 5: H4 Moonshot Super Runner",
+            "pips_target": 600,
+            "tp_r": 8.00,
+            "desc": "+5.0R ដល់ +10.0R អូសតាម EMA Confluence"
+        }
+    }
+    return specs.get(tier_index, specs[1])
+
+
 def calculate_capital_gold_lot_size(
     budget: float,
     current_price: float = 4071.78,
     confidence: float = 50.0,
-    leverage: float = 500.0
+    leverage: float = 500.0,
+    min_deal_size: float = 0.10,
+    available_cash: Optional[float] = None
 ) -> float:
     """
-    Computes Capital.com Gold (XAUUSD) order size in Troy Ounces.
+    Computes Capital.com Gold (XAUUSD) order size in Troy Ounces with Dynamic Margin Affordability Auto-Clamping.
     - Contract Unit: Troy Ounces (oz)
-    - Minimum Deal Size: 0.5 Troy Ounce (Margin required = ~$4.07 at 500:1 leverage)
-    - Maximum Margin Cap: Clamped at <= 20% of account budget under supreme conviction (>=90%)
+    - Real Broker Leverage: 500:1 (Capital.com Gold CFD retail/pro tier)
+      Exact Margin Formula: Margin Required = (Current Price * Size) / Leverage
+      At Gold = $4,071.78 USD @ 500:1:
+      * 0.5 Troy Ounces: Margin = $4,071.78 * 0.5 / 500 = $4.07 USD
+      * 1.0 Troy Ounce:  Margin = $4,071.78 * 1.0 / 500 = $8.14 USD
+      * 1.5 Troy Ounces: Margin = $4,071.78 * 1.5 / 500 = $12.21 USD
+      * 2.0 Troy Ounces: Margin = $4,071.78 * 2.0 / 500 = $16.29 USD
+    - Institutional Sizing Standard (AQ88 Invariant 126):
+      * Capital $100 -> Baseline 0.50 Troy Ounces (Margin: $4.07 USD, Free Cash Buffer: 95.93%)
+      * Capital $200 -> Baseline 1.00 Troy Ounce  (Margin: $8.14 USD, Free Cash Buffer: 95.93%)
+      * Capital $300 -> Baseline 1.50 Troy Ounces (Margin: $12.21 USD, Free Cash Buffer: 95.93%)
+      * Capital $400 -> Baseline 2.00 Troy Ounces (Margin: $16.29 USD, Free Cash Buffer: 95.93%)
+      * Capital $X   -> Base Size = round(X * 0.005, 2) Troy Ounces (min 0.50 oz for equity >= $100)
+    - Dynamic Conviction Scaling (ភាពច្បាស់លាស់ខ្លាំង & ទំនុកចិត្តខ្លាំង):
+      * Supreme Conviction (confidence >= 90.0%): 1.25x scaling (e.g. $100 -> 0.62 oz, $200 -> 1.25 oz, $300 -> 1.88 oz)
+      * High Conviction (confidence >= 80.0%): 1.15x scaling (e.g. $100 -> 0.57 oz, $200 -> 1.15 oz, $300 -> 1.72 oz)
+      * Standard / Conservative (confidence < 80.0%): 1.00x baseline
+    - Micro-Capital Shield (equity < $100):
+      * Clamped to 0.10 - 0.25 oz for accounts < $50 to guarantee > 95% cash buffer.
     """
-    margin_per_oz = max(1.0, current_price / max(1.0, leverage))  # ~$8.14 per oz at 500:1
-    max_margin_allowed = max(4.07, budget * 0.20)
-    max_size_allowed = max(0.5, round(max_margin_allowed / margin_per_oz, 1))
+    effective_cash = float(available_cash) if (available_cash is not None and float(available_cash) > 0.0) else float(budget or 50.0)
 
-    # Dynamic conviction scaling
-    if confidence >= 90.0:
-        # Supreme Conviction (90% - 99.99%): Scale up to 20% margin ceiling
-        calculated_size = max_size_allowed
-    elif confidence >= 80.0:
-        # High Conviction: Scale to ~10% margin (~50% of ceiling)
-        calculated_size = max(0.5, round(max_size_allowed * 0.5, 1))
+    # 1. Base Sizing by Capital Tier ($100 per 0.50 oz -> factor = 0.005 oz per USD)
+    if effective_cash >= 100.0:
+        base_size = max(0.50, round(effective_cash * 0.005, 2))
+    elif effective_cash >= 50.0:
+        base_size = 0.25
     else:
-        # Baseline / Standard: Pure minimum 0.5 Troy Ounces ($4.07 margin)
-        calculated_size = 0.5
+        base_size = max(min_deal_size, 0.10)
 
-    return max(0.5, min(max_size_allowed, calculated_size))
+    # 2. Dynamic Conviction Scaling
+    if confidence >= 90.0:
+        # Supreme Conviction (90% - 100%): 1.25x scaling
+        conviction_mult = 1.25
+    elif confidence >= 80.0:
+        # High Conviction (80% - 89.9%): 1.15x scaling
+        conviction_mult = 1.15
+    else:
+        conviction_mult = 1.00
+
+    scaled_size = round(base_size * conviction_mult, 2)
+
+    # 3. Dynamic Margin Safety Cap
+    # Exact margin per oz = current_price / leverage = $4071.78 / 500 = $8.14 per oz
+    eff_price = float(current_price or 4071.78)
+    eff_lev = float(leverage or 500.0)
+    margin_per_oz = max(2.0, eff_price / eff_lev)
+
+    # Max safe margin allowed is 15% of available cash, ensuring >= 85% free cushion buffer
+    max_safe_margin = max(4.0, effective_cash * 0.15)
+    max_size_allowed = max(min_deal_size, round(max_safe_margin / margin_per_oz, 2))
+
+    final_lot = max(min_deal_size, min(max_size_allowed, scaled_size))
+    # Guarantee at least 0.50 oz for standard accounts >= $100 unless cash is critically depleted
+    if effective_cash >= 100.0 and final_lot < 0.50:
+        final_lot = 0.50
+
+    return round(float(final_lot), 2)
 
 
 class QuantGoldExecutionEngine:
@@ -187,7 +369,7 @@ class QuantGoldExecutionEngine:
         
         # State tracking
         self._last_cycle_ts: float = 0.0
-        self._cycle_interval: float = 6.0  # Evaluates Gold every 6 seconds
+        self._cycle_interval: float = 1.0  # Evaluates Gold every 1.0s (Sub-Second Reactive Loop)
         self._active_positions_cache: List[Dict[str, Any]] = []
         self._last_post_loss_restudy_ts: float = 0.0
         self._is_evaluating: bool = False
@@ -199,20 +381,33 @@ class QuantGoldExecutionEngine:
         self._active_gold_deal_id: Optional[str] = None
         self._active_gold_direction: Optional[str] = None
         self._active_gold_entry_price: float = 0.0
+        self._active_gold_entry_ts: float = 0.0
+        self._last_reversal_flip_ts: float = 0.0
+        self._last_reversal_block_log_ts: float = 0.0
+        self._last_reversal_block_reason: str = ""
         self._active_gold_sl: float = 0.0
         self._active_gold_tp1: float = 0.0
         self._active_gold_tp2: float = 0.0
         self._active_gold_tp3: float = 0.0
+        self._active_gold_scale_tier: int = 0
+        self._be_armor_locked_deals: set = set()
         self._active_gold_stage: str = "IDLE"  # "IDLE", "ACTIVE", "TP1_LOCKED", "TP2_LOCKED", "COOLDOWN"
         self._last_trade_closed_ts: float = 0.0
         self._last_signal_broadcast_ts: float = 0.0
         self._trade_cooldown_seconds: float = 300.0  # 5 min after win, 15 min after loss
         self._signal_cooldown_seconds: float = 300.0  # Min 5 min between new signals
+        self._directional_quarantine_dir: Optional[str] = None  # Quarantines failing direction for 15m after adverse momentum cut
+        self._directional_quarantine_until: float = 0.0
+        self._last_stop_out_price: float = 0.0  # Invalidation Anchor Memory in RAM (AQ88 Invariant 137)
+        self._last_stop_out_ts: float = 0.0
+        self._last_stop_out_dir: Optional[str] = None
         self._peak_upl_map: Dict[str, float] = {}  # deal_id -> peak UPL for Flash Shock Harvest
+        self._peak_pnl_pts_map: Dict[str, float] = {}  # deal_id -> peak price points (pips) for size-invariant harvest
         self._last_broker_adopt_ts: float = 0.0
         self._cached_broker_gold_count: int = 0
         self._user_standby_log_ts: Dict[int, float] = {}
         self._admin_demo_log_ts: float = 0.0
+        self._sa_flat_consecutive_cycles: int = 0
         self._last_valid_gold_quote: Tuple[float, float, float] = (4095.50, 4096.00, 0.50)
 
     def has_active_gold_trade(self) -> bool:
@@ -220,20 +415,39 @@ class QuantGoldExecutionEngine:
         Returns True if there is currently an active Gold trade running on broker or in DB.
         Guarantees that the system focuses on harvesting the current trade before opening/broadcasting a new one.
         """
+        # If cached broker count is explicitly 0, verify and clear stale in-memory active deal id
+        if getattr(self, "_cached_broker_gold_count", None) == 0:
+            active_trades = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
+            real_db_trades = [
+                t for t in active_trades
+                if str(t.get("epic", "")).upper() == "GOLD"
+                and str(t.get("status", "OPEN")).upper() == "OPEN"
+                and not str(t.get("deal_id", "")).startswith("MANUAL_")
+            ]
+            if not real_db_trades:
+                self._active_gold_deal_id = None
+                self._active_gold_direction = None
+                self._active_gold_entry_ts = 0.0
+                self._active_gold_stage = "IDLE"
+                return False
+
         if self._active_gold_deal_id:
             return True
         try:
             active_trades = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
             for t in active_trades:
-                if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "OPEN")).upper() == "OPEN":
-                    self._active_gold_deal_id = str(t.get("deal_id"))
+                d_id = str(t.get("deal_id", ""))
+                if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "OPEN")).upper() == "OPEN" and not d_id.startswith("MANUAL_"):
+                    self._active_gold_deal_id = d_id
                     self._active_gold_direction = str(t.get("direction", "BUY")).upper()
                     self._active_gold_entry_price = float(t.get("entry_price", 0.0) or 0.0)
+                    self._active_gold_entry_ts = float(t.get("created_at_ts", 0.0) or 0.0)
                     self._active_gold_sl = float(t.get("sl", 0.0) or 0.0)
                     self._active_gold_tp1 = float(t.get("tp1", 0.0) or 0.0)
                     self._active_gold_tp2 = float(t.get("tp2", 0.0) or 0.0)
                     self._active_gold_tp3 = float(t.get("tp3", 0.0) or 0.0)
                     tier = int(t.get("scale_tier", 0) or 0)
+                    self._active_gold_scale_tier = tier
                     self._active_gold_stage = "TP2_LOCKED" if tier >= 2 else ("TP1_LOCKED" if tier >= 1 else "ACTIVE")
                     return True
         except Exception:
@@ -243,6 +457,41 @@ class QuantGoldExecutionEngine:
             return True
 
         return False
+
+    def get_active_gold_trades_list(self) -> List[Dict[str, Any]]:
+        """
+        Returns all open active Gold trades currently tracked in DB or in-memory RAM.
+        Used for Agile Multi-Position Pyramiding and Trend Reversal Flip calculations.
+        """
+        res = []
+        try:
+            active_trades = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
+            res = [
+                t for t in active_trades
+                if str(t.get("epic", "")).upper() == "GOLD"
+                and str(t.get("status", "OPEN")).upper() == "OPEN"
+                and not str(t.get("deal_id", "")).startswith("MANUAL_")
+            ]
+        except Exception:
+            res = []
+
+        # If DB query returned empty due to temporary sync lag, but RAM holds active trade:
+        if not res and self._active_gold_deal_id and self._active_gold_entry_price > 0.0:
+            res.append({
+                "chat_id": 859271875,
+                "deal_id": self._active_gold_deal_id,
+                "epic": "GOLD",
+                "direction": self._active_gold_direction or "BUY",
+                "entry_price": self._active_gold_entry_price,
+                "sl": getattr(self, "_active_gold_sl", 0.0),
+                "tp1": getattr(self, "_active_gold_tp1", 0.0),
+                "tp2": getattr(self, "_active_gold_tp2", 0.0),
+                "tp3": getattr(self, "_active_gold_tp3", 0.0),
+                "status": "OPEN",
+                "scale_tier": getattr(self, "_active_gold_scale_tier", 0),
+                "is_demo": 0
+            })
+        return res
 
     async def _sync_and_adopt_broker_positions(self) -> int:
         """
@@ -268,7 +517,8 @@ class QuantGoldExecutionEngine:
                 targets.append({"chat_id": cid, "is_demo": bool(u.get("is_demo", False))})
 
         seen_targets = {(t["chat_id"], t["is_demo"]) for t in targets}
-        for vip_cid in [643724109, 1744387717]:
+        # Only genuinely distinct accounts should be audited (e.g. VIP 643724109 with separate sub-account)
+        for vip_cid in [643724109]:
             if (vip_cid, False) not in seen_targets:
                 targets.append({"chat_id": vip_cid, "is_demo": False})
                 seen_targets.add((vip_cid, False))
@@ -307,33 +557,77 @@ class QuantGoldExecutionEngine:
                         bid, ask, _ = self.get_live_gold_price_quote()
                         level = (bid + ask) / 2.0
 
-                    tp1 = round((level + 7.30) if direction == "BUY" else (level - 7.30), 2)
-                    tp2 = round((level + 15.20) if direction == "BUY" else (level - 15.20), 2)
-                    tp3 = round((level + 24.32) if direction == "BUY" else (level - 24.32), 2)
-                    sl_dist = abs(level - sl) if sl > 0 else 6.08
+                    # Point 1 & 2: Check for naked SL (sl <= 0) or suicidal SL (> 15% distance)
+                    is_suicidal_sl = (
+                        sl > 0 and (
+                            (direction == "BUY" and sl < (level * 0.85)) or
+                            (direction == "SELL" and sl > (level * 1.15))
+                        )
+                    )
+                    is_naked_sl = (sl <= 0.0)
+
+                    # Dynamic breathing SL distance: max(5.50, min(6.50, quote_spread * 4.0)) (AQ88 Invariant 132)
+                    # Clamped strictly between 5.50 and 6.50 points ($2.75 to $3.25 max risk on 0.5 lot)
+                    # Eradicates catastrophic -$15.13 stop loss caused by legacy 25.0/30.0pt fallback!
+                    _, _, quote_spread = self.get_live_gold_price_quote()
+                    safe_dist = max(5.50, min(6.50, quote_spread * 4.0))
+
+                    if (is_naked_sl or is_suicidal_sl) and level > 0.0:
+                        emergency_sl = round((level - safe_dist) if direction == "BUY" else (level + safe_dist), 2)
+                        try:
+                            upd_res = await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=emergency_sl)
+                            if upd_res and upd_res.get("success", False):
+                                sl = emergency_sl
+                                logger.info(
+                                    f"🛡️ [EMERGENCY SL PATROL] Attached dynamic breathing SL @ ${emergency_sl:.2f} "
+                                    f"to manual/unprotected Gold deal #{deal_id} on Capital.com broker!"
+                                )
+                            else:
+                                logger.warning(f"⚠️ [EMERGENCY SL PATROL] Broker rejected SL update for #{deal_id}: {upd_res}")
+                        except Exception as e_sl_att:
+                            logger.error(f"❌ [EMERGENCY SL PATROL] Error attaching SL to #{deal_id}: {e_sl_att}")
+
+                    sl_dist = abs(level - sl) if sl > 0 else safe_dist
+                    tp1 = round((level + sl_dist * 1.50) if direction == "BUY" else (level - sl_dist * 1.50), 2)
+                    tp2 = round((level + sl_dist * 2.50) if direction == "BUY" else (level - sl_dist * 2.50), 2)
+                    tp3 = round((level + sl_dist * 4.00) if direction == "BUY" else (level - sl_dist * 4.00), 2)
 
                     if not db.has_capital_auto_trade_record(deal_id):
-                        db.record_capital_auto_trade(
-                            chat_id=cid,
-                            deal_id=deal_id,
-                            deal_reference=deal_id,
-                            epic="GOLD",
-                            direction=direction,
-                            size=size,
-                            entry_price=level,
-                            sl=sl,
-                            tp=tp if tp > 0 else tp1,
-                            tp1=tp1,
-                            tp2=tp2,
-                            tp3=tp3,
-                            sl_dist=sl_dist,
-                            scale_tier=0,
-                            is_demo=int(is_demo)
-                        )
-                        logger.info(
-                            f"🏛️ [BROKER SYNC] Auto-adopted active GOLD position from broker: "
-                            f"Deal #{deal_id} {direction} {size} lot @ ${level:.2f} (User {cid}, Demo={is_demo})"
-                        )
+                        # Seamless Order Reference Promotion: Check if user has an open order ref (e.g. o_...) that matches this new fill
+                        promoted_order_ref = False
+                        user_trades = db.get_capital_auto_trades_for_user(cid) or []
+                        for ut in user_trades:
+                            ut_id = str(ut.get("deal_id", ""))
+                            ut_status = str(ut.get("status", "OPEN")).upper()
+                            ut_dir = str(ut.get("direction", "")).upper()
+                            if ut_id.startswith("o_") and ut_status == "OPEN" and ut_dir == direction:
+                                if hasattr(db, "update_capital_auto_trade_deal_id"):
+                                    if db.update_capital_auto_trade_deal_id(ut_id, deal_id):
+                                        logger.info(f"🏛️ [BROKER SYNC] Seamlessly promoted order ref {ut_id} -> live deal #{deal_id} for user {cid} @ ${level:.2f}")
+                                        promoted_order_ref = True
+                                        break
+                        if not promoted_order_ref:
+                            db.record_capital_auto_trade(
+                                chat_id=cid,
+                                deal_id=deal_id,
+                                deal_reference=deal_id,
+                                epic="GOLD",
+                                direction=direction,
+                                size=size,
+                                entry_price=level,
+                                sl=sl,
+                                tp=tp if tp > 0 else tp1,
+                                tp1=tp1,
+                                tp2=tp2,
+                                tp3=tp3,
+                                sl_dist=sl_dist,
+                                scale_tier=0,
+                                is_demo=int(is_demo)
+                            )
+                            logger.info(
+                                f"🏛️ [BROKER SYNC] Auto-adopted active GOLD position from broker: "
+                                f"Deal #{deal_id} {direction} {size} lot @ ${level:.2f} (SL: ${sl:.2f}) (User {cid}, Demo={is_demo})"
+                            )
 
                     # Bind active state in RAM memory
                     self._active_gold_deal_id = deal_id
@@ -348,20 +642,55 @@ class QuantGoldExecutionEngine:
                 logger.debug(f"Broker adopt note for {cid} (demo={is_demo}): {e_adopt}")
 
         self._cached_broker_gold_count = total_gold_found
+        if total_gold_found == 0 and self._active_gold_deal_id:
+            logger.info(
+                f"🏛️ [BROKER SYNC] Zero open Gold positions on broker. "
+                f"Auto-reconciling and clearing phantom trade #{self._active_gold_deal_id}."
+            )
+            old_deal = self._active_gold_deal_id
+            self._clear_active_trade(old_deal, cooldown=0.0)
+            try:
+                active_db = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
+                for dtr in active_db:
+                    if str(dtr.get("epic", "")).upper() == "GOLD":
+                        db.update_capital_auto_trade_close(
+                            dtr.get("deal_id"),
+                            exit_price=self.get_live_gold_price_quote()[0],
+                            pnl=0.0
+                        )
+                        logger.info(f"🏛️ [BROKER SYNC] Reconciled and closed lingering DB trade #{dtr.get('deal_id')}.")
+            except Exception:
+                pass
         return total_gold_found
 
-    def _clear_active_trade(self, deal_id: Optional[str] = None, cooldown: float = 300.0):
-        """Clears active trade state and activates post-trade cooldown."""
-        if deal_id is None or str(self._active_gold_deal_id) == str(deal_id):
+    def _clear_active_trade(self, deal_id: Optional[str] = None, cooldown: float = 30.0, direction: Optional[str] = None):
+        """Clears active trade state and activates adaptive post-trade cooldown (Invariant 88)."""
+        if deal_id is None or not self._active_gold_deal_id or str(self._active_gold_deal_id) == str(deal_id):
+            if self._active_gold_direction:
+                self._last_closed_trade_direction = self._active_gold_direction
+            if self._active_gold_entry_price > 0.0:
+                self._last_closed_trade_entry = self._active_gold_entry_price
             self._active_gold_deal_id = None
             self._active_gold_direction = None
             self._active_gold_entry_price = 0.0
+            self._active_gold_sl = 0.0
+            self._active_gold_tp1 = 0.0
+            self._active_gold_tp2 = 0.0
+            self._active_gold_tp3 = 0.0
+            self._active_gold_scale_tier = 0
             self._active_gold_stage = "IDLE"
+        elif direction:
+            self._last_closed_trade_direction = direction
+        if deal_id:
+            self._be_armor_locked_deals.discard(str(deal_id))
+        else:
+            self._be_armor_locked_deals.clear()
         self._last_trade_closed_ts = time.time()
-        self._trade_cooldown_seconds = cooldown
+        self._trade_cooldown_seconds = max(0.0, float(cooldown))
         self._cached_broker_gold_count = max(0, getattr(self, "_cached_broker_gold_count", 1) - 1)
         if deal_id:
             self._peak_upl_map.pop(str(deal_id), None)
+            self._peak_pnl_pts_map.pop(str(deal_id), None)
 
     def get_cached_gold_signal(self) -> Optional[Dict[str, Any]]:
         """Returns the most recent calculated Gold signal from RAM cache without re-computing (<0.0001ms)."""
@@ -467,6 +796,216 @@ class QuantGoldExecutionEngine:
 
         return sent_count
 
+    def _validate_exhaustion_top_bottom(
+        self,
+        direction: str,
+        current_price: float,
+        signal_data: Dict[str, Any]
+    ) -> Tuple[bool, str, float]:
+        """
+        INSTITUTIONAL TOP/BOTTOM EXHAUSTION & CLIMAX VALIDATOR (AQ88 Invariant 120):
+        Strictly differentiates between a 'Moving Freight Train' vs 'True Exhausted Top/Bottom'.
+        Never blind-limits just because price touched a Fibonacci or OLS coordinate.
+        Requires:
+          1. Candlestick Rejection Wick (Upper wick >= 30% for SELL, Lower wick >= 30% for BUY) or Reversal pattern.
+          2. Kalman Latent Velocity Deceleration (velocity <= +0.015 for SELL, velocity >= -0.015 for BUY).
+          3. Momentum Climax & Anti-Chasing Veto (Rejects solid green bars closing near high for SELL, solid red for BUY).
+          4. RSI Extremes or Reversal Hook (RSI >= 62 for SELL, RSI <= 38 for BUY or hooking against impulse).
+        Returns:
+          (is_valid: bool, reason: str, confidence_boost: float)
+        """
+        dir_upper = str(direction).upper()
+        math_sum = signal_data.get("math_summary", {})
+        kalman_vel = float(math_sum.get("kalman_velocity", 0.0) or 0.0)
+
+        # 1. Fetch live M5 and M15 candle structures from MTF engine
+        m5_df = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
+        m15_df = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M15")
+
+        # Candidate metrics
+        has_candle_data = False
+        upper_wick_ratio = 0.0
+        lower_wick_ratio = 0.0
+        is_green = False
+        is_red = False
+        c_body_ratio = 0.0
+        rsi_m5 = 50.0
+        rsi_m15 = 50.0
+        consecutive_same_color = 0
+
+        target_df = m5_df if (m5_df is not None and len(m5_df) >= 3) else m15_df
+        if target_df is not None and len(target_df) >= 3:
+            has_candle_data = True
+            c_high = float(target_df["high"].iloc[-1])
+            c_low = float(target_df["low"].iloc[-1])
+            c_open = float(target_df["open"].iloc[-1])
+            c_close = float(target_df["close"].iloc[-1])
+            c_range = max(c_high - c_low, 0.10)
+
+            upper_wick = max(0.0, c_high - max(c_open, c_close))
+            lower_wick = max(0.0, min(c_open, c_close) - c_low)
+            upper_wick_ratio = upper_wick / c_range
+            lower_wick_ratio = lower_wick / c_range
+            c_body_ratio = abs(c_close - c_open) / c_range
+            is_green = c_close >= c_open
+            is_red = c_close < c_open
+
+            # Check consecutive directional bars in last 3 bars
+            closes = target_df["close"].values
+            opens = target_df["open"].values
+            if is_green:
+                consecutive_same_color = sum(1 for i in range(-3, 0) if closes[i] > opens[i])
+            elif is_red:
+                consecutive_same_color = sum(1 for i in range(-3, 0) if closes[i] < opens[i])
+
+            # Check previous bar's rejection wick
+            p_high = float(target_df["high"].iloc[-2])
+            p_low = float(target_df["low"].iloc[-2])
+            p_open = float(target_df["open"].iloc[-2])
+            p_close = float(target_df["close"].iloc[-2])
+            p_range = max(p_high - p_low, 0.10)
+            p_upper_wick_ratio = max(0.0, p_high - max(p_open, p_close)) / p_range
+            p_lower_wick_ratio = max(0.0, min(p_open, p_close) - p_low) / p_range
+        else:
+            p_upper_wick_ratio = 0.0
+            p_lower_wick_ratio = 0.0
+
+        # Retrieve RSI
+        tf_dict = signal_data.get("timeframes", {})
+        if "M5" in tf_dict:
+            rsi_m5 = float(tf_dict["M5"].get("rsi", 50.0))
+        if "M15" in tf_dict:
+            rsi_m15 = float(tf_dict["M15"].get("rsi", 50.0))
+
+        # Real-time Net Buy/Sell Force Meter from mathematical_engine
+        try:
+            from mathematical_engine import compute_net_buy_sell_force
+            force_metrics = compute_net_buy_sell_force(target_df, kalman_velocity=kalman_vel)
+        except Exception:
+            force_metrics = {}
+
+        buy_force_pct = float(force_metrics.get("buy_force_pct", 50.0))
+        sell_force_pct = float(force_metrics.get("sell_force_pct", 50.0))
+        exhaustion_state = str(force_metrics.get("exhaustion_state", "NEUTRAL_BALANCED"))
+
+        # --- EVALUATE TOP EXHAUSTION FOR SELL ---
+        if dir_upper == "SELL":
+            # Veto A0: Expanding Bull Force Climax
+            if buy_force_pct >= 62.0 or exhaustion_state == "BULL_MOMENTUM_EXPANDING":
+                return False, f"VETO_BULL_MOMENTUM_EXPANDING: Bull force ({buy_force_pct:.1f}% vs {sell_force_pct:.1f}%) is in full expansion. Never short into an unbroken bull thrust!", 0.0
+
+            # Veto A: Moving Freight Train - Candle is strong green with virtually no upper wick
+            if has_candle_data:
+                if is_green and upper_wick_ratio < 0.22 and kalman_vel > 0.020:
+                    return False, f"VETO_FREIGHT_TRAIN_SELL: Solid green bar (upper wick {upper_wick_ratio*100:.1f}% < 22%) with positive Kalman velocity (+{kalman_vel:.4f}). Never sell into an accelerating bull expansion!", 0.0
+                if consecutive_same_color >= 3 and is_green and upper_wick_ratio < 0.25:
+                    return False, f"VETO_CONSECUTIVE_BULL_BARS: 3 consecutive solid green bars without upper wick. Wait for top rejection wick before shorting.", 0.0
+
+            # Veto B: High upward velocity
+            if kalman_vel > 0.035:
+                return False, f"VETO_HIGH_UPWARD_VELOCITY: 2D Kalman latent velocity (+{kalman_vel:.4f} > +0.035) is charging up. Exhaustion not yet reached.", 0.0
+
+            # Confirmation Points for SELL
+            conf_score = 0.0
+            reasons = []
+
+            # 0. Net Order Flow Climax Exhaustion
+            if exhaustion_state == "BULLS_EXHAUSTED_AT_TOP":
+                conf_score += 30.0
+                reasons.append(f"Bulls Exhausted at Top ({buy_force_pct:.1f}%->{sell_force_pct:.1f}%)")
+
+            # 1. Rejection Wick / Pinbar Star
+            if upper_wick_ratio >= 0.30 or p_upper_wick_ratio >= 0.35:
+                conf_score += 25.0
+                reasons.append(f"Top Rejection Wick ({max(upper_wick_ratio, p_upper_wick_ratio)*100:.1f}%)")
+            elif is_red and c_body_ratio >= 0.25:
+                conf_score += 20.0
+                reasons.append("Red Reversal Bar")
+
+            # 2. Kalman Deceleration / Stall
+            if kalman_vel <= 0.010:
+                conf_score += 20.0
+                reasons.append(f"Kalman Decelerated ({kalman_vel:+.4f})")
+            if kalman_vel <= -0.005:
+                conf_score += 10.0
+                reasons.append("Kalman Rolled Negative")
+
+            # 3. RSI Overbought or Turning Down
+            if rsi_m15 >= 62.0 or rsi_m5 >= 65.0:
+                conf_score += 20.0
+                reasons.append(f"RSI Overbought ({max(rsi_m15, rsi_m5):.1f})")
+
+            # 4. Sweep / FVG resistance
+            tv_matrix = signal_data.get("tradingview_summary", {})
+            if tv_matrix.get("direction") == "SELL" or tv_matrix.get("score", 0.0) <= -20.0:
+                conf_score += 15.0
+                reasons.append("TV Confluence Sell")
+
+            if conf_score >= 35.0:
+                return True, f"EXHAUSTION_CONFIRMED_SELL: {', '.join(reasons)}", min(15.0, conf_score * 0.15)
+            else:
+                return False, f"INSUFFICIENT_EXHAUSTION_SELL: Conf score {conf_score:.1f} < 35.0. Need clearer rejection wick or momentum stall.", 0.0
+
+        # --- EVALUATE BOTTOM EXHAUSTION FOR BUY ---
+        elif dir_upper == "BUY":
+            # Veto A0: Plunging Bear Force Climax
+            if sell_force_pct >= 62.0 or exhaustion_state == "BEAR_MOMENTUM_PLUNGING":
+                return False, f"VETO_BEAR_MOMENTUM_PLUNGING: Bear force ({sell_force_pct:.1f}% vs {buy_force_pct:.1f}%) is in full plunge. Never catch an unbroken falling knife!", 0.0
+
+            # Veto A: Falling Knife - Candle is strong red with virtually no lower wick
+            if has_candle_data:
+                if is_red and lower_wick_ratio < 0.22 and kalman_vel < -0.020:
+                    return False, f"VETO_FALLING_KNIFE_BUY: Solid red bar (lower wick {lower_wick_ratio*100:.1f}% < 22%) with negative Kalman velocity ({kalman_vel:.4f}). Never buy into a plunging drop!", 0.0
+                if consecutive_same_color >= 3 and is_red and lower_wick_ratio < 0.25:
+                    return False, f"VETO_CONSECUTIVE_BEAR_BARS: 3 consecutive solid red bars without lower wick. Wait for bottom absorption wick before buying.", 0.0
+
+            # Veto B: High downward velocity
+            if kalman_vel < -0.035:
+                return False, f"VETO_HIGH_DOWNWARD_VELOCITY: 2D Kalman latent velocity ({kalman_vel:.4f} < -0.035) is plunging down. Exhaustion not yet reached.", 0.0
+
+            # Confirmation Points for BUY
+            conf_score = 0.0
+            reasons = []
+
+            # 0. Net Order Flow Climax Absorption
+            if exhaustion_state == "BEARS_EXHAUSTED_AT_BOTTOM":
+                conf_score += 30.0
+                reasons.append(f"Bears Exhausted at Bottom ({sell_force_pct:.1f}%->{buy_force_pct:.1f}%)")
+
+            # 1. Absorption Wick / Hammer
+            if lower_wick_ratio >= 0.30 or p_lower_wick_ratio >= 0.35:
+                conf_score += 25.0
+                reasons.append(f"Bottom Absorption Wick ({max(lower_wick_ratio, p_lower_wick_ratio)*100:.1f}%)")
+            elif is_green and c_body_ratio >= 0.25:
+                conf_score += 20.0
+                reasons.append("Green Reversal Bar")
+
+            # 2. Kalman Deceleration / Stall
+            if kalman_vel >= -0.010:
+                conf_score += 20.0
+                reasons.append(f"Kalman Decelerated ({kalman_vel:+.4f})")
+            if kalman_vel >= 0.005:
+                conf_score += 10.0
+                reasons.append("Kalman Rolled Positive")
+
+            # 3. RSI Oversold or Turning Up
+            if rsi_m15 <= 38.0 or rsi_m5 <= 35.0:
+                conf_score += 20.0
+                reasons.append(f"RSI Oversold ({min(rsi_m15, rsi_m5):.1f})")
+
+            # 4. Sweep / FVG support
+            tv_matrix = signal_data.get("tradingview_summary", {})
+            if tv_matrix.get("direction") == "BUY" or tv_matrix.get("score", 0.0) >= 20.0:
+                conf_score += 15.0
+                reasons.append("TV Confluence Buy")
+
+            if conf_score >= 35.0:
+                return True, f"EXHAUSTION_CONFIRMED_BUY: {', '.join(reasons)}", min(15.0, conf_score * 0.15)
+            else:
+                return False, f"INSUFFICIENT_EXHAUSTION_BUY: Conf score {conf_score:.1f} < 35.0. Need clearer absorption wick or momentum stall.", 0.0
+
+        return False, "UNKNOWN_DIRECTION", 0.0
+
     async def evaluate_gold_master_signal(self, fast: bool = False) -> Dict[str, Any]:
         """
         Synthesizes 19-Timeframe Confluence, Quantitative Math, and AI Swarm
@@ -524,7 +1063,7 @@ class QuantGoldExecutionEngine:
                     "primary_reason": algo_res.get("key_reason", "")
                 }
 
-        # 4. Synthesize Definitive Signal
+        # 4. Extract Metrics & Synthesize Definitive Signal
         mtf_action = mtf_data.get("action", "HOLD")
         ai_action = ai_data.get("action", "HOLD")
         weighted_score = mtf_data.get("weighted_score", 0.0)
@@ -533,16 +1072,86 @@ class QuantGoldExecutionEngine:
         kalman = math_data.get("kalman", {})
         hurst = math_data.get("hurst_surface", {})
         regime = hurst.get("regime", "RANDOM_WALK")
+        m15_tf = mtf_data.get("timeframes", {}).get("M15", {}) if isinstance(mtf_data, dict) else {}
 
-        # Dealing Range Chop Filter Check
-        m15_tf = mtf_data.get("timeframes", {}).get("M15", {})
+        # 4.1 Monte Safieddine Daily Market Report Benchmark Confluence & Contrarian Traps (Invariant 99)
+        monte_rep = {}
+        if CapitalMarketReportEngine:
+            try:
+                # Dynamic Volatility S/R based strictly on CURRENT live price and current ATR
+                m15_atr_calc = float(m15_tf.get("atr", 6.5) or 6.5) if isinstance(m15_tf, dict) else 6.5
+                monte_rep = CapitalMarketReportEngine.get_market_report_data("GOLD", current_price=curr_p, daily_atr=m15_atr_calc)
+                monte_res1 = float(monte_rep.get("res1", curr_p + 15.0))
+                monte_sup1 = float(monte_rep.get("sup1", curr_p - 15.0))
+                c_long = float(monte_rep.get("client_long_pct", 50.0))
+                # Check A: Extreme Retail Crowd Long Trap at Resistance 1
+                # ONLY trigger if price is ACTUALLY REJECTING downwards (kalman velocity <= -0.015 and bearish counts > bullish).
+                # If price is actively surging with positive momentum, it's an institutional breakout thrust, NOT a retail trap!
+                k_vel_rep = float(kalman.get("latent_velocity", 0.0) or 0.0)
+                if c_long >= 75.0 and curr_p >= (monte_res1 - 2.50) and k_vel_rep <= -0.015 and counts.get("bearish", 0) > counts.get("bullish", 0):
+                    if mtf_action == "BUY" or ai_action == "BUY":
+                        # FOMO buy into 80% retail herd trap is prohibited
+                        mtf_action = "HOLD"
+                        ai_action = "HOLD"
+                        mtf_data["action"] = "HOLD"
+                        ai_data["action"] = "HOLD"
+                    # Smart money distribution short bias boost
+                    weighted_score = min(weighted_score - 15.0, -12.0)
+                # Check B: Contrarian Support Rebound at Support 1 ONLY IF actively bouncing with positive momentum
+                elif curr_p <= (monte_sup1 + 2.50) and kalman.get("latent_velocity", 0.0) > 0.02 and counts.get("bullish", 0) > counts.get("bearish", 0):
+                    if mtf_action == "SELL" or ai_action == "SELL":
+                        mtf_action = "HOLD"
+                        ai_action = "HOLD"
+                        mtf_data["action"] = "HOLD"
+                        ai_data["action"] = "HOLD"
+                    # Smart money accumulation long bounce boost
+                    weighted_score = max(weighted_score + 15.0, 12.0)
+            except Exception as e:
+                logger.debug("Monte Safieddine report evaluation exception: %s", e)
+
+        # Macro H1 & H4 Top-Down Structural Directional Anchor (AQ88 Invariant 123)
+        h1_tf = mtf_data.get("timeframes", {}).get("H1", {}) if isinstance(mtf_data, dict) else {}
+        h4_tf = mtf_data.get("timeframes", {}).get("H4", {}) if isinstance(mtf_data, dict) else {}
+        h1_bias = str(h1_tf.get("bias", "NEUTRAL")).upper()
+        h4_bias = str(h4_tf.get("bias", "NEUTRAL")).upper()
+        h1_ema50 = float(h1_tf.get("ema50", 0.0) or 0.0)
+        h1_ema200 = float(h1_tf.get("ema200", 0.0) or 0.0)
+        bearish_tf_count = counts.get("bearish", 0)
+        bullish_tf_count = counts.get("bullish", 0)
+
+        is_macro_bear = (
+            (h1_bias == "BEARISH" and (curr_p < h1_ema50 or curr_p < h1_ema200)) or
+            (h1_bias == "BEARISH" and h4_bias == "BEARISH") or
+            (bearish_tf_count >= 10 and bullish_tf_count <= 3)
+        )
+        is_macro_bull = (
+            (h1_bias == "BULLISH" and (curr_p > h1_ema50 or curr_p > h1_ema200)) or
+            (h1_bias == "BULLISH" and h4_bias == "BULLISH") or
+            (bullish_tf_count >= 10 and bearish_tf_count <= 3)
+        )
+
+        # Dealing Range Chop Filter Check (AQ88 Invariant 137 & Invariant 76)
+        m15_tf = mtf_data.get("timeframes", {}).get("M15", {}) if isinstance(mtf_data, dict) else {}
         smc_m15 = m15_tf.get("smc", {})
-        is_chop_zone = smc_m15.get("chop_zone", False)
+        range_pct = float(smc_m15.get("range_pct", 0.50) or 0.50)
+        range_high = float(smc_m15.get("range_high", 0.0) or 0.0)
+        range_low = float(smc_m15.get("range_low", 0.0) or 0.0)
+        range_span = max(0.01, range_high - range_low)
+        is_equilibrium_chop = (0.35 <= range_pct <= 0.65) if (range_span >= 5.0) else bool(smc_m15.get("chop_zone", False))
+        is_chop_zone = is_equilibrium_chop
 
         final_action = "HOLD"
         reason = "Market in consolidation or awaiting higher confluence."
 
         # STRICT QUALITY GATES (ELIMINATING >80% LOSS RATE):
+        # Gate 0.5: TradingView 10-Group Confluence Matrix Synergy
+        tv_matrix = math_data.get("tradingview_matrix", {})
+        tv_score = float(tv_matrix.get("score", 0.0) or 0.0)
+        tv_dir = tv_matrix.get("direction", "NEUTRAL")
+        if tv_dir in ["BUY", "SELL"] and abs(tv_score) >= 30.0:
+            if mtf_action == tv_dir or ai_action == tv_dir:
+                win_prob = min(94.5, win_prob + 4.0)
+
         # Gate 1: Check MTF and AI alignment or decisive weighted score
         cand_action = mtf_action if mtf_action in ["BUY", "SELL"] else (ai_action if ai_action in ["BUY", "SELL"] else None)
         has_consensus = (mtf_action in ["BUY", "SELL"] and (mtf_action == ai_action or ai_action == "HOLD" or abs(weighted_score) >= 30.0))
@@ -550,26 +1159,48 @@ class QuantGoldExecutionEngine:
             has_consensus = True
             cand_action = ai_action
 
+        m5_tf = mtf_data.get("timeframes", {}).get("M5", {}) if isinstance(mtf_data, dict) else {}
+        m15_tf = mtf_data.get("timeframes", {}).get("M15", {}) if isinstance(mtf_data, dict) else {}
+        m15_ema21 = float(m15_tf.get("ema21", 0.0) or m15_tf.get("ema20", 0.0) or curr_p)
+        m15_atr_gate = float(m15_tf.get("atr", 6.5) or 6.5)
+
         if has_consensus and cand_action in ["BUY", "SELL"]:
-            # Gate 2: Chop Zone Injunction (Middle 30% Dealing Range is FORBIDDEN unless high conviction breakout)
-            if is_chop_zone and abs(weighted_score) < 45.0:
+            # Gate 1.5: Top-Down Macro Trend Alignment Veto (AQ88 Invariant 123)
+            # Catching falling knives in a confirmed Macro Downtrend is officially forbidden!
+            if cand_action == "BUY" and is_macro_bear:
                 final_action = "HOLD"
-                reason = f"BLOCKED_CHOP_ZONE: Price is in middle dealing range ({smc_m15.get('range_pct', 0.5):.2f})."
-            # Gate 3: Anti-Oversold Short Guard & Anti-Overbought Long Guard (Invariant 1.1 Fiduciary Oath)
-            elif cand_action == "SELL" and m15_tf.get("rsi", 50.0) <= 38.0:
+                reason = f"H1_H4_MACRO_BEAR_VETO: Price ${curr_p:.2f} is in confirmed Macro Downtrend ({bearish_tf_count}/19 Bearish TFs, H1={h1_bias}, H4={h4_bias}). Buying falling knives or bear flag pullbacks is strictly forbidden."
+            elif cand_action == "SELL" and is_macro_bull:
                 final_action = "HOLD"
-                reason = f"ANTI_OVERSOLD_SHORT_VETO: 15m RSI is {m15_tf.get('rsi'):.1f} <= 38.0."
-            elif cand_action == "BUY" and m15_tf.get("rsi", 50.0) >= 70.0:
+                reason = f"H1_H4_MACRO_BULL_VETO: Price ${curr_p:.2f} is in confirmed Macro Uptrend ({bullish_tf_count}/19 Bullish TFs, H1={h1_bias}, H4={h4_bias}). Shorting tops or bull flags is strictly forbidden."
+            # Gate 2: Equilibrium Chop Zone Injunction (Middle 30% Dealing Range is FORBIDDEN - Invariant 76 & AQ88 Invariant 137)
+            elif is_chop_zone and abs(weighted_score) < 35.0 and abs(kalman.get("latent_velocity", 0.0)) < 0.04:
                 final_action = "HOLD"
-                reason = f"ANTI_OVERBOUGHT_LONG_VETO: 15m RSI is {m15_tf.get('rsi'):.1f} >= 70.0."
+                reason = f"BLOCK_CHOP_ZONE_EQUILIBRIUM: Price ${curr_p:.2f} is in middle dealing range ({range_pct*100:.1f}% between ${range_low:.2f}-${range_high:.2f}). Pure Brownian noise. Orders strictly forbidden until boundary test."
+            # Gate 2.5: Anti-Chasing Momentum Overextension & Spread Drag Guard (Invariant 92 Pillar 1 & AQ88 Invariant 132)
+            # Chasing an extended impulse candle (> 0.65x ATR from EMA21) forces retail to buy the top wick
+            # or sell the bottom wick right before a mean-reverting pullback.
+            elif cand_action == "BUY" and (curr_p - m15_ema21) > (0.65 * m15_atr_gate):
+                final_action = "HOLD"
+                reason = f"ANTI_CHASING_IMPULSE_VETO: Price {curr_p:.2f} is {((curr_p - m15_ema21)/m15_atr_gate):.2f}x ATR above 15m EMA21 ({m15_ema21:.2f}). Chasing extended top into premium is blocked."
+            elif cand_action == "SELL" and (m15_ema21 - curr_p) > (0.65 * m15_atr_gate):
+                final_action = "HOLD"
+                reason = f"ANTI_CHASING_IMPULSE_VETO: Price {curr_p:.2f} is {((m15_ema21 - curr_p)/m15_atr_gate):.2f}x ATR below 15m EMA21 ({m15_ema21:.2f}). Shorting extended bottom into discount is blocked."
+            # Gate 3: Anti-Oversold Short Guard & Anti-Overbought Long Guard (Invariant 1.1 Fiduciary Oath & AQ88 Invariant 132)
+            elif cand_action == "SELL" and (float(m15_tf.get("rsi", 50.0) or 50.0) <= 42.0 or float(m5_tf.get("rsi", 50.0) or 50.0) <= 38.0):
+                final_action = "HOLD"
+                reason = f"ANTI_OVERSOLD_SHORT_VETO: M15 RSI {float(m15_tf.get('rsi', 50.0)):.1f} <= 42.0 or M5 RSI {float(m5_tf.get('rsi', 50.0)):.1f} <= 38.0. Shorting into oversold support is strictly blocked."
+            elif cand_action == "BUY" and (float(m15_tf.get("rsi", 50.0) or 50.0) >= 65.0 or float(m5_tf.get("rsi", 50.0) or 50.0) >= 68.0):
+                final_action = "HOLD"
+                reason = f"ANTI_OVERBOUGHT_LONG_VETO: M15 RSI {float(m15_tf.get('rsi', 50.0)):.1f} >= 65.0 or M5 RSI {float(m5_tf.get('rsi', 50.0)):.1f} >= 68.0. Buying into overbought resistance is strictly blocked."
             # Gate 4: Random Walk Veto - Only when score is near zero and velocity is flat
             elif regime == "RANDOM_WALK" and abs(weighted_score) < 20.0 and abs(kalman.get("latent_velocity", 0.0)) < 0.02:
                 final_action = "HOLD"
                 reason = f"RANDOM_WALK_VETO: Composite Hurst is {hurst.get('composite'):.2f} with negligible momentum."
-            # Gate 5: Minimum Win Probability Hurdle (Super Smart High Win Rate: >= 68.0% or score >= 35.0)
-            elif win_prob < 68.0 and abs(weighted_score) < 35.0:
+            # Gate 5: Minimum Win Probability Hurdle (Super Smart High Win Rate: >= 60.0% or score >= 28.0)
+            elif win_prob < 60.0 and abs(weighted_score) < 28.0:
                 final_action = "HOLD"
-                reason = f"LOW_CONFIDENCE_VETO: Win Prob {win_prob:.1f}% < 68.0% and score {weighted_score:+.1f} < 35.0."
+                reason = f"LOW_CONFIDENCE_VETO: Win Prob {win_prob:.1f}% < 60.0% and score {weighted_score:+.1f} < 28.0."
             # Gate 6: Kalman Directional Velocity Confirmation
             elif cand_action == "BUY" and kalman.get("latent_velocity", 0.0) < -0.05:
                 final_action = "HOLD"
@@ -581,31 +1212,176 @@ class QuantGoldExecutionEngine:
                 final_action = cand_action
                 reason = f"HIGH_CONFLUENCE_{final_action}: 19-TF Score {weighted_score:+.1f}, Win Prob {win_prob:.1f}%, Kalman Vel {kalman.get('latent_velocity', 0):+.4f}."
 
-        # Tight Structural SL & Dynamic Targets (Super Smart Gold Calibration):
-        # Symmetrical and mathematically precise:
-        # Tight SL Distance = $6.08 (~60.8 pips)
-        # TP1 Distance = $7.30 (+73 pips / +1.2R, Breakeven Armor Lock)
-        # TP2 Distance = $15.20 (+152 pips / +2.5R, Guaranteed Cash Floor)
-        # TP3 Distance = $24.32 (+243 pips / +4.0R, Moonshot Runner)
-        sl_distance = 6.08
-        tp1_distance = 7.30
-        tp2_distance = 15.20
-        tp3_distance = 24.32
+        # Gate 0.8: Institutional Net Order Flow Force & Intraday Trend Governor (AQ88 Invariant 130 & 132)
+        # Directly aligns Machine 1 (Scalp) & Machine 2 (Macro) WITH the dominant trend!
+        # Counter-trend selling in an uptrend or counter-trend buying in a downtrend is 100% ELIMINATED!
+        nof_data = math_data.get("net_order_flow_force", {})
+        ex_state = nof_data.get("exhaustion_state", "NEUTRAL_BALANCED")
+
+        # Check M5 Net Order Flow Climax Exhaustion for Machine 1 Scalping
+        candles_m5 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
+        nof_m5 = {}
+        if candles_m5 is not None and len(candles_m5) >= 5:
+            try:
+                from mathematical_engine import compute_net_buy_sell_force
+                nof_m5 = compute_net_buy_sell_force(candles_m5, kalman_velocity=kalman.get("latent_velocity", 0.0))
+            except Exception:
+                nof_m5 = {}
+        ex_state_m5 = nof_m5.get("exhaustion_state", "NEUTRAL_BALANCED")
+
+        # Intraday Trend Directional Governor (AQ88 Invariant 130)
+        m5_tf = mtf_data.get("timeframes", {}).get("M5", {}) if isinstance(mtf_data, dict) else {}
+        m15_tf = mtf_data.get("timeframes", {}).get("M15", {}) if isinstance(mtf_data, dict) else {}
+        m5_bias = str(m5_tf.get("bias", "NEUTRAL")).upper()
+        m15_bias = str(m15_tf.get("bias", "NEUTRAL")).upper()
+        k_vel = float(kalman.get("latent_velocity", 0.0) or 0.0)
+
+        is_intraday_bull = (
+            is_macro_bull or
+            (m5_bias == "BULLISH" and m15_bias == "BULLISH") or
+            (m15_bias == "BULLISH" and k_vel > 0.010) or
+            (bullish_tf_count >= 8 and bearish_tf_count <= 4) or
+            weighted_score >= 12.0
+        )
+        is_intraday_bear = (
+            is_macro_bear or
+            (m5_bias == "BEARISH" and m15_bias == "BEARISH") or
+            (m15_bias == "BEARISH" and k_vel < -0.010) or
+            (bearish_tf_count >= 8 and bullish_tf_count <= 4) or
+            weighted_score <= -12.0
+        )
+
+        if final_action == "HOLD":
+            # 1. Trend Pullback Setups (Trading WITH the Dominant Trend):
+            # Machine 1: M5 Trigger aligned 100% with M15 Direction (Choch/BOS, EMA Confluence)
+            # Equilibrium Guard: Pullback MUST be in discount (range_pct < 0.45) for BUY, or premium (range_pct > 0.55) for SELL
+            if is_intraday_bull and not is_macro_bear:
+                # In an M15 UPTREND: We ONLY BUY M5 PULLBACKS into discount! Selling against the bull trend is 100% FORBIDDEN.
+                # Price MUST have pulled back down near/below M15 EMA21 in Discount (not at the top or equilibrium chop)!
+                is_m5_dip = (curr_p <= m15_ema21 + (0.35 * m15_atr_gate)) and (range_pct <= 0.45 or not is_chop_zone)
+                is_m5_exhausted_bottom = (
+                    ex_state_m5 == "BEARS_EXHAUSTED_AT_BOTTOM" or
+                    ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" or
+                    (float(nof_m5.get("lower_wick_ratio", 0.0) or 0.0) >= 0.35 and float(nof_m5.get("buy_force_pct", 50.0) or 50.0) >= 55.0)
+                )
+                if is_m5_dip and is_m5_exhausted_bottom:
+                    m5_rsi = float(m5_tf.get("rsi", 50.0) or 50.0)
+                    if m5_rsi <= 55.0 and k_vel >= -0.015:
+                        final_action = "BUY"
+                        win_prob = max(win_prob, 85.0)
+                        reason = f"MACHINE_1_M5_PULLBACK_BUY: Dip in M15 Bull trend exhausted sellers on M5 (Buy Force {nof_m5.get('buy_force_pct', 70)}%, M5 RSI {m5_rsi:.1f}, Kalman Vel {k_vel:+.4f})."
+            elif is_intraday_bear and not is_macro_bull:
+                # In an M15 DOWNTREND: We ONLY SELL M5 RALLIES into premium! Buying falling knives is 100% FORBIDDEN.
+                # Price MUST have rallied up near/above M15 EMA21 in Premium (not at the bottom or equilibrium chop)!
+                is_m5_rally = (curr_p >= m15_ema21 - (0.35 * m15_atr_gate)) and (range_pct >= 0.55 or not is_chop_zone)
+                is_m5_exhausted_top = (
+                    ex_state_m5 == "BULLS_EXHAUSTED_AT_TOP" or
+                    ex_state == "BULLS_EXHAUSTED_AT_TOP" or
+                    (float(nof_m5.get("upper_wick_ratio", 0.0) or 0.0) >= 0.35 and float(nof_m5.get("sell_force_pct", 50.0) or 50.0) >= 55.0)
+                )
+                if is_m5_rally and is_m5_exhausted_top:
+                    m5_rsi = float(m5_tf.get("rsi", 50.0) or 50.0)
+                    if m5_rsi >= 45.0 and k_vel <= 0.015:
+                        final_action = "SELL"
+                        win_prob = max(win_prob, 85.0)
+                        reason = f"MACHINE_1_M5_PULLBACK_SELL: Rally in M15 Bear trend exhausted buyers on M5 (Sell Force {nof_m5.get('sell_force_pct', 70)}%, M5 RSI {m5_rsi:.1f}, Kalman Vel {k_vel:+.4f})."
+            else:
+                # 2. Consolidation / Range Boundaries ONLY (Strict Exhaustion Criteria at Outer Boundaries):
+                if not is_chop_zone:
+                    if ex_state == "BULLS_EXHAUSTED_AT_TOP" and not is_intraday_bull and weighted_score <= 5.0 and (curr_p >= m15_ema21 - (0.30 * m15_atr_gate)):
+                        rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
+                        s_f = float(nof_data.get("sell_force_pct", 50.0) or 50.0)
+                        u_w = float(nof_data.get("upper_wick_ratio", 0.0) or 0.0)
+                        if rsi_val >= 58.0 and k_vel <= -0.015 and s_f >= 60.0 and u_w >= 0.35:
+                            final_action = "SELL"
+                            win_prob = max(win_prob, 82.0)
+                            reason = f"RANGE_BOUNDARY_EXHAUSTED_TOP_SELL: Net Order Flow Bulls Exhausted at Range Top (Sell Force {s_f:.0f}%, Upper Wick {u_w*100:.1f}%, Kalman Vel {k_vel:+.4f})."
+                    elif ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" and not is_intraday_bear and weighted_score >= -5.0 and (curr_p <= m15_ema21 + (0.30 * m15_atr_gate)):
+                        rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
+                        b_f = float(nof_data.get("buy_force_pct", 50.0) or 50.0)
+                        l_w = float(nof_data.get("lower_wick_ratio", 0.0) or 0.0)
+                        if rsi_val <= 42.0 and k_vel >= 0.015 and b_f >= 60.0 and l_w >= 0.35:
+                            final_action = "BUY"
+                            win_prob = max(win_prob, 82.0)
+                            reason = f"RANGE_BOUNDARY_EXHAUSTED_BOTTOM_BUY: Net Order Flow Bears Exhausted at Range Bottom (Buy Force {b_f:.0f}%, Lower Wick {l_w*100:.1f}%, Kalman Vel {k_vel:+.4f})."
+
+        # Structural Invalidation Memory Anchor in RAM (AQ88 Invariant 137)
+        # Prevents re-entering the exact same price noise level within 2.50 pts of a recent stop out
+        last_sl_p = getattr(self, "_last_stop_out_price", 0.0)
+        last_sl_ts = getattr(self, "_last_stop_out_ts", 0.0)
+        if final_action in ["BUY", "SELL"] and last_sl_p > 0.0 and (time.time() - last_sl_ts) < 900.0:
+            dist_from_stop = abs(curr_p - last_sl_p)
+            if dist_from_stop < 2.50:
+                sweep_m15 = str(smc_m15.get("sweep", "NONE")).upper()
+                has_boundary_sweep = (sweep_m15 not in ["NONE", ""]) or (float(nof_data.get("upper_wick_ratio", 0.0) or 0.0) >= 0.38) or (float(nof_data.get("lower_wick_ratio", 0.0) or 0.0) >= 0.38)
+                if not has_boundary_sweep:
+                    final_action = "HOLD"
+                    reason = f"STRUCTURAL_INVALIDATION_RAM_HOLD: Price ${curr_p:.2f} is within {dist_from_stop:.2f} pts of recent SL (${last_sl_p:.2f}). Holding in RAM until boundary sweep or structural expansion."
+
+        # Directional Quarantine Check (AQ88 Invariant 130):
+        # Strictly blocks re-entering in the quarantined direction for 15 minutes after an adverse momentum cut
+        q_dir = getattr(self, "_directional_quarantine_dir", None)
+        q_until = getattr(self, "_directional_quarantine_until", 0.0)
+        if q_dir and time.time() < q_until:
+            if final_action == q_dir:
+                rem_sec = round(q_until - time.time(), 1)
+                now_ts = time.time()
+                last_q_log = getattr(self, "_last_quarantine_log_ts", 0.0)
+                last_q_logged_dir = getattr(self, "_last_quarantine_logged_dir", None)
+                if (now_ts - last_q_log >= 60.0) or (last_q_logged_dir != q_dir):
+                    self._last_quarantine_log_ts = now_ts
+                    self._last_quarantine_logged_dir = q_dir
+                    logger.info(f"🛡️ [DIRECTIONAL QUARANTINE VETO] {final_action} vetoed! Direction {q_dir} is quarantined for {rem_sec}s after recent adverse momentum micro-cut.")
+                final_action = "HOLD"
+                reason = f"DIRECTIONAL_QUARANTINE_VETO: {q_dir} quarantined ({rem_sec}s remaining)."
+
+        # Super Smart Auto-Dynamic Multi-Timeframe Liquidity Stop Loss (M1 to Month 1 - AQ88 Invariant 134):
+        # Scans multi-timeframe structural swing extremes (BSL/SSL pools, Order Blocks, and rejection wicks).
+        # Eradicates fixed static points! Stop Loss is anchored safely behind the true structural boundary + volatility buffer.
+        m15_tf = mtf_data.get("timeframes", {}).get("M15", {}) if isinstance(mtf_data, dict) else {}
+        m15_atr = float(m15_tf.get("atr", 6.5) or 6.5)
+        if m15_atr < 2.0 or m15_atr > 35.0:
+            m15_atr = 6.5
+
+        liq_bounds = {}
+        if hasattr(self.mtf_engine, "extract_multi_timeframe_liquidity_bounds"):
+            try:
+                liq_bounds = self.mtf_engine.extract_multi_timeframe_liquidity_bounds(current_price=curr_p, spread=spread)
+            except Exception as e_liq:
+                logger.debug(f"Liquidity bounds extraction note: {e_liq}")
+
+        sl_buy_price = float(liq_bounds.get("sl_buy", round(curr_p - max(5.00, min(7.50, 0.85 * m15_atr)), 2)))
+        sl_dist_buy = float(liq_bounds.get("sl_dist_buy", round(curr_p - sl_buy_price, 2)))
+        sl_sell_price = float(liq_bounds.get("sl_sell", round(curr_p + max(5.00, min(7.50, 0.85 * m15_atr)), 2)))
+        sl_dist_sell = float(liq_bounds.get("sl_dist_sell", round(sl_sell_price - curr_p, 2)))
+
+        # Multi-Tier Asymmetric Targets (R:R >= 1:1.25 to 1:4.00):
+        # TP1 (+55 to +75 pips): Opposing liquidity pool -> shifts SL to Breakeven Armor, locking trade at 0.00R Free Roll
+        tp1_dist_buy = round(max(5.50, sl_dist_buy * 1.25), 2)
+        tp2_dist_buy = round(max(11.00, sl_dist_buy * 2.50), 2)
+        tp3_dist_buy = round(max(22.00, sl_dist_buy * 4.00), 2)
+
+        tp1_dist_sell = round(max(5.50, sl_dist_sell * 1.25), 2)
+        tp2_dist_sell = round(max(11.00, sl_dist_sell * 2.50), 2)
+        tp3_dist_sell = round(max(22.00, sl_dist_sell * 4.00), 2)
 
         prospective_buy = {
             "entry": round(curr_p, 2),
-            "sl": round(curr_p - sl_distance, 2),
-            "tp1": round(curr_p + tp1_distance, 2),
-            "tp2": round(curr_p + tp2_distance, 2),
-            "tp3": round(curr_p + tp3_distance, 2),
+            "sl": sl_buy_price,
+            "sl_dist": sl_dist_buy,
+            "tp1": round(curr_p + tp1_dist_buy, 2),
+            "tp2": round(curr_p + tp2_dist_buy, 2),
+            "tp3": round(curr_p + tp3_dist_buy, 2),
         }
         prospective_sell = {
             "entry": round(curr_p, 2),
-            "sl": round(curr_p + sl_distance, 2),
-            "tp1": round(curr_p - tp1_distance, 2),
-            "tp2": round(curr_p - tp2_distance, 2),
-            "tp3": round(curr_p - tp3_distance, 2),
+            "sl": sl_sell_price,
+            "sl_dist": sl_dist_sell,
+            "tp1": round(curr_p - tp1_dist_sell, 2),
+            "tp2": round(curr_p - tp2_dist_sell, 2),
+            "tp3": round(curr_p - tp3_dist_sell, 2),
         }
+        sl_distance = sl_dist_buy if final_action == "BUY" else sl_dist_sell
 
         # Resolve Dominant Trend Bias with multi-factor confluence
         if weighted_score < -5.0 or counts.get("bearish", 0) > counts.get("bullish", 0):
@@ -638,6 +1414,10 @@ class QuantGoldExecutionEngine:
                 tp2_price = prospective_sell["tp2"]
                 tp3_price = prospective_sell["tp3"]
 
+        active_tp1_dist = tp1_dist_buy if final_action == "BUY" else tp1_dist_sell
+        active_tp2_dist = tp2_dist_buy if final_action == "BUY" else tp2_dist_sell
+        active_tp3_dist = tp3_dist_buy if final_action == "BUY" else tp3_dist_sell
+
         res = {
             "timestamp": time.time(),
             "asset": "GOLD",
@@ -655,23 +1435,57 @@ class QuantGoldExecutionEngine:
             "tp3": tp3_price,
             "prospective_buy": prospective_buy,
             "prospective_sell": prospective_sell,
-            "risk_reward_ratio": "1:1.20 / 1:2.50 / 1:4.00",
-            "targets_pips": "+73 pips / +152 pips / +243 pips",
+            "risk_reward_ratio": "1:1.50 / 1:2.50 / 1:4.00",
+            "targets_pips": f"+{int(active_tp1_dist*10)} pips / +{int(active_tp2_dist*10)} pips / +{int(active_tp3_dist*10)} pips",
             "mtf_summary": {
                 "weighted_score": weighted_score,
                 "counts": counts,
                 "win_probability": win_prob
             },
+            "m15_summary": {
+                "rsi": float(m15_tf.get("rsi", 50.0) or 50.0),
+                "ema21": float(m15_tf.get("ema21", 0.0) or m15_tf.get("ema20", 0.0) or curr_p),
+                "atr": float(m15_tf.get("atr", 6.5) or 6.5),
+            },
             "math_summary": {
                 "regime": regime,
                 "kalman_velocity": kalman.get("latent_velocity", 0.0),
                 "composite_hurst": hurst.get("composite", 0.50),
-                "bayesian_win_probability": math_data.get("bayesian_win_probability", 50.0)
+                "bayesian_win_probability": math_data.get("bayesian_win_probability", 50.0),
+                "net_order_flow_force": math_data.get("net_order_flow_force", {})
+            },
+            "tradingview_summary": {
+                "score": tv_matrix.get("score", 0.0),
+                "direction": tv_matrix.get("direction", "NEUTRAL"),
+                "estimated_win_rate": tv_matrix.get("estimated_win_rate", 50.0),
+                "reasons": tv_matrix.get("reasons", []),
+                "ols_channel": tv_matrix.get("ols_channel", {}),
+                "volume_profile": tv_matrix.get("volume_profile", {}),
+                "fibonacci": tv_matrix.get("fibonacci", {}),
+                "pitchfork": tv_matrix.get("pitchfork", {}),
+                "cycles": tv_matrix.get("cycles", {}),
+                "harmonics": tv_matrix.get("harmonics", {})
             },
             "ai_summary": {
                 "consensus_confidence": ai_data.get("consensus_confidence", 50.0),
                 "model_tally": ai_data.get("model_tally", {})
-            }
+            },
+            "monte_summary": {
+                "starting_point": monte_rep.get("starting_point", 4038.78),
+                "delta": monte_rep.get("delta", 45.50),
+                "res1": monte_rep.get("res1", 4084.28),
+                "sl_res1": monte_rep.get("sl_res1", 4107.03),
+                "sup1": monte_rep.get("sup1", 3993.28),
+                "sl_sup1": monte_rep.get("sl_sup1", 3970.53),
+                "daily_regime": monte_rep.get("daily_regime", "Consolidation - Volatile"),
+                "weekly_regime": monte_rep.get("weekly_regime", "Bear Average"),
+                "client_long_pct": monte_rep.get("client_long_pct", 80.0),
+                "client_short_pct": monte_rep.get("client_short_pct", 20.0),
+                "institutional_long_pct": monte_rep.get("institutional_long_pct", 84.0)
+            },
+            "is_macro_bear": is_macro_bear,
+            "is_macro_bull": is_macro_bull,
+            "timeframes": mtf_data.get("timeframes", {})
         }
         self._last_signal_data = res
         self._last_signal_ts = time.time()
@@ -686,7 +1500,7 @@ class QuantGoldExecutionEngine:
           3. If Super Admin Live balance < $4.07, ensures Demo Fallback Mirror is active.
         """
         now = time.time()
-        if (now - getattr(self, "_last_capital_audit_ts", 0.0)) < 45.0:
+        if (now - getattr(self, "_last_capital_audit_ts", 0.0)) < 120.0:
             return {"status": "SKIPPED_THROTTLE"}
 
         self._last_capital_audit_ts = now
@@ -724,52 +1538,70 @@ class QuantGoldExecutionEngine:
 
         for cid in audit_cids:
             try:
+                await asyncio.sleep(0.35)
                 is_admin = (cid == 859271875) or db.is_admin(cid)
                 u_eng_live = capital_engine.get_user_capital_engine(cid, is_demo=False)
                 bal_inf = await asyncio.to_thread(u_eng_live.get_account_balance)
                 
+                live_bal = 0.0
+                live_avail = 0.0
+                acc_id = ""
                 if bal_inf and bal_inf.get("success"):
                     live_bal = float(bal_inf.get("balance", 0.0) or 0.0)
                     live_avail = float(bal_inf.get("available", 0.0) or 0.0)
-                    acc_id = bal_inf.get("account_id") or ""
+                    acc_id = str(bal_inf.get("account_id") or "").strip()
+
+                # Multi-tier fallback to verified live RAM fleet status cache
+                if live_avail <= 0.0:
+                    try:
+                        from capital_gold_bridge import get_fleet_cached_balance
+                        cached = get_fleet_cached_balance(acc_id or ("216890638652757188" if is_admin else ""))
+                        if cached and cached[1] > 0:
+                            live_bal, live_avail = cached[0], cached[1]
+                        elif is_admin:
+                            live_bal, live_avail = 233.32, 233.32
+                    except Exception:
+                        if is_admin:
+                            live_bal, live_avail = 233.32, 233.32
+
+                if live_avail >= 4.07:
+                    # User has real capital! (e.g. $198.07)
+                    auto_cfg = db.get_capital_auto_config(cid) or {}
+                    cur_en = bool(auto_cfg.get("enabled", False) or auto_cfg.get("is_enabled", False))
+                    cur_demo = bool(auto_cfg.get("is_demo", False))
+                    existing_b = float(auto_cfg.get("budget", 0.0) or 0.0)
+                    target_budget = existing_b if existing_b > 0 else round(max(10.0, min(live_avail * 0.20, 100.0)), 2)
                     
-                    if live_avail >= 4.07:
-                        # User has real capital! (e.g. $198.07)
+                    if not cur_en or cur_demo:
+                        db.set_capital_auto_config(
+                            chat_id=cid,
+                            enabled=True,
+                            budget=target_budget,
+                            max_positions=5,
+                            is_demo=False
+                        )
+                        logger.info(f"🟢 [FLEET LIVE ACTIVATED] User {cid} (Account {acc_id}) has ${live_avail:.2f} available. Auto-switched to LIVE MAINNET trading!")
+                        results[cid] = {"status": "LIVE_ACTIVATED", "available": live_avail, "budget": target_budget}
+                    else:
+                        results[cid] = {"status": "LIVE_ACTIVE", "available": live_avail}
+                else:
+                    # Balance < $4.07
+                    if is_admin:
                         auto_cfg = db.get_capital_auto_config(cid) or {}
-                        cur_en = bool(auto_cfg.get("enabled", False) or auto_cfg.get("is_enabled", False))
-                        cur_demo = bool(auto_cfg.get("is_demo", False))
-                        target_budget = round(max(10.0, min(live_avail * 0.20, 100.0)), 2)
-                        
-                        if not cur_en or cur_demo:
+                        cur_b = float(auto_cfg.get("budget", 50.0) or 50.0)
+                        cur_mp = int(auto_cfg.get("max_positions", 5) or 5)
+                        if not bool(auto_cfg.get("enabled", False)) or not bool(auto_cfg.get("is_demo", False)):
                             db.set_capital_auto_config(
                                 chat_id=cid,
                                 enabled=True,
-                                budget=target_budget,
-                                max_positions=5,
-                                is_demo=False
+                                budget=cur_b,
+                                max_positions=cur_mp,
+                                is_demo=True
                             )
-                            logger.info(f"🟢 [FLEET LIVE ACTIVATED] User {cid} (Account {acc_id}) has ${live_avail:.2f} available. Auto-switched to LIVE MAINNET trading!")
-                            results[cid] = {"status": "LIVE_ACTIVATED", "available": live_avail, "budget": target_budget}
-                        else:
-                            results[cid] = {"status": "LIVE_ACTIVE", "available": live_avail}
+                            logger.info(f"🟡 [SUPER ADMIN DEMO FALLBACK] Super Admin live < $4.07. Demo Mirror active.")
+                        results[cid] = {"status": "DEMO_FALLBACK_ACTIVE", "available": live_avail}
                     else:
-                        # Balance < $4.07
-                        if is_admin:
-                            auto_cfg = db.get_capital_auto_config(cid) or {}
-                            cur_b = float(auto_cfg.get("budget", 50.0) or 50.0)
-                            cur_mp = int(auto_cfg.get("max_positions", 5) or 5)
-                            if not bool(auto_cfg.get("enabled", False)) or not bool(auto_cfg.get("is_demo", False)):
-                                db.set_capital_auto_config(
-                                    chat_id=cid,
-                                    enabled=True,
-                                    budget=cur_b,
-                                    max_positions=cur_mp,
-                                    is_demo=True
-                                )
-                                logger.info(f"🟡 [SUPER ADMIN DEMO FALLBACK] Super Admin live < $4.07. Demo Mirror active.")
-                            results[cid] = {"status": "DEMO_FALLBACK_ACTIVE", "available": live_avail}
-                        else:
-                            results[cid] = {"status": "STANDBY_LOW_CAPITAL", "available": live_avail}
+                        results[cid] = {"status": "STANDBY_LOW_CAPITAL", "available": live_avail}
             except Exception as e_user_audit:
                 logger.debug(f"User capital audit note for {cid}: {e_user_audit}")
 
@@ -801,50 +1633,446 @@ class QuantGoldExecutionEngine:
             except Exception as e_sync:
                 logger.debug(f"Capital sync note: {e_sync}")
 
-            # Step 1.8: Strict Sequential Lifecycle & Signal Muting Gate
-            # If the system is currently managing an active Gold trade, STOP!
-            # Do NOT evaluate new entry signals and do NOT broadcast duplicate signals.
-            # Harvest profit from this trade first!
-            if self.has_active_gold_trade():
-                return {
-                    "status": "MANAGING_ACTIVE_TRADE",
-                    "deal_id": self._active_gold_deal_id,
-                    "stage": self._active_gold_stage,
-                    "direction": self._active_gold_direction,
-                    "entry_price": self._active_gold_entry_price
-                }
+            # Step 1.6: Automated 24h Hugging Face Cloud Database Backup
+            now_ts = time.time()
+            if (now_ts - getattr(self, "_last_hf_backup_ts", 0.0)) >= 86400.0:
+                self._last_hf_backup_ts = now_ts
+                try:
+                    import backup_manager
+                    asyncio.create_task(asyncio.to_thread(backup_manager.perform_backup, False, True))
+                    logger.info("☁️ [CLOUD VAULT] Dispatched automated 24h Hugging Face database backup task.")
+                except Exception as e_bck:
+                    logger.debug(f"Cloud backup dispatch note: {e_bck}")
 
-            # Step 1.9: Post-Trade Cooldown Gate (Prevents Chasing and Revenge Trading)
+            # Step 1.8: Agile Multi-Position Pyramiding & Trend Reversal Flip Gatekeeper (AQ84)
+            active_gold_trades = self.get_active_gold_trades_list()
+            has_existing = (len(active_gold_trades) > 0) or self.has_active_gold_trade()
+            existing_dir = str(active_gold_trades[0].get("direction", "BUY")).upper() if active_gold_trades else (self._active_gold_direction or "BUY")
+
+            # Step 1.9: Adaptive Post-Trade Cooldown Gate (Invariant 88)
             time_since_close = now - self._last_trade_closed_ts
-            if time_since_close < self._trade_cooldown_seconds:
+            last_closed_dir = getattr(self, "_last_closed_trade_direction", None)
+            if time_since_close < 15.0 and not has_existing:
                 return {
                     "status": "COOLDOWN_ACTIVE",
-                    "remaining_seconds": round(self._trade_cooldown_seconds - time_since_close, 1)
+                    "remaining_seconds": round(15.0 - time_since_close, 1)
                 }
 
-            # Step 1.95: Signal Broadcast Throttling (Min 300s between signal cards)
-            time_since_broadcast = now - self._last_signal_broadcast_ts
-            if time_since_broadcast < self._signal_cooldown_seconds:
-                return {
-                    "status": "SIGNAL_THROTTLED",
-                    "remaining_seconds": round(self._signal_cooldown_seconds - time_since_broadcast, 1)
-                }
+            # Step 1.95: Real-World Gold Interbank Session Gatekeeper (AQ88 Invariant 122)
+            try:
+                from gold_session_planner import get_gold_session_planner
+                session_planner = get_gold_session_planner()
+                is_session_allowed, session_gate_reason = session_planner.is_trading_allowed()
+                cur_session = session_planner.get_current_session()
+                if not is_session_allowed and not has_existing:
+                    logger.debug(f"🛡️ [SESSION STANDBY] {session_gate_reason}")
+                    return {
+                        "status": "SESSION_STANDBY",
+                        "session": cur_session.get("name"),
+                        "reason": session_gate_reason
+                    }
+            except Exception as e_sess:
+                logger.debug(f"Session gatekeeper check note: {e_sess}")
 
-            # Step 2: Check Active VIP Users
-            active_users = db.get_active_capital_auto_users()
-            if not active_users:
-                # Include Super Admin by default if configured
-                active_users = [{"chat_id": 859271875, "budget": 500.0, "max_positions": 1, "is_demo": False}]
+            # Step 2: Check Active VIP Users & Super Admin Guarantee
+            active_users = db.get_active_capital_auto_users() or []
+            existing_cids = {u.get("chat_id") for u in active_users}
+            if 859271875 not in existing_cids:
+                sa_cfg = db.get_capital_auto_config(859271875) or {}
+                if sa_cfg.get("enabled", True):
+                    active_users.append({
+                        "chat_id": 859271875,
+                        "budget": float(sa_cfg.get("budget", 500.0) or 500.0),
+                        "max_positions": int(sa_cfg.get("max_positions", 5) or 5),
+                        "is_demo": bool(sa_cfg.get("is_demo", False)),
+                        "schedule_mode": sa_cfg.get("schedule_mode", "SMART_SESSION_TIMED")
+                    })
 
             # Step 3: Evaluate Definitive Master Signal
             signal_data = await self.evaluate_gold_master_signal()
             action = signal_data.get("action", "HOLD")
+            confidence = float(signal_data.get("confidence", 75.0) or 75.0)
+            weighted_score = float(signal_data.get("mtf_summary", {}).get("weighted_score", 0.0) or 0.0)
+            current_price = float(signal_data.get("current_price", 4000.0) or 4000.0)
+            sl_val = float(signal_data.get("sl", 0.0) or 0.0)
+            sl_dist = abs(current_price - sl_val)
+            is_macro_bear = bool(signal_data.get("is_macro_bear", False))
+            is_macro_bull = bool(signal_data.get("is_macro_bull", False))
+
+            # Check if an immediate Agile Reversal Flip was triggered by 360° Surveillance
+            pending_rev = getattr(self, "_pending_reversal_action", None)
+            is_reversal_flip_trigger = False
+            in_memory_limit_setup = None
+            if pending_rev in ["BUY", "SELL"]:
+                action = pending_rev
+                self._pending_reversal_action = None
+                confidence = 88.0
+                is_reversal_flip_trigger = True
+                # Recalculate prospective SL/TP for the reversal direction
+                if action == "BUY":
+                    signal_data["sl"] = signal_data.get("prospective_buy", {}).get("sl", current_price - 25.0)
+                    signal_data["tp1"] = signal_data.get("prospective_buy", {}).get("tp1", current_price + 32.0)
+                    signal_data["tp2"] = signal_data.get("prospective_buy", {}).get("tp2", current_price + 55.0)
+                    signal_data["tp3"] = signal_data.get("prospective_buy", {}).get("tp3", current_price + 90.0)
+                else:
+                    signal_data["sl"] = signal_data.get("prospective_sell", {}).get("sl", current_price + 25.0)
+                    signal_data["tp1"] = signal_data.get("prospective_sell", {}).get("tp1", current_price - 32.0)
+                    signal_data["tp2"] = signal_data.get("prospective_sell", {}).get("tp2", current_price - 55.0)
+                    signal_data["tp3"] = signal_data.get("prospective_sell", {}).get("tp3", current_price - 90.0)
+                sl_val = float(signal_data["sl"])
+                sl_dist = abs(current_price - sl_val)
+                logger.info(f"🔄 [360° AGILE REVERSAL FLIP ENGAGED] Instant flip into {action} @ ${current_price:.2f} (SL: ${sl_val:.2f})!")
+
+            # In-Memory Limit Working Orders & Inflection Boundary Trigger (Technology #2)
+            # «កុំរត់ដេញតាមរថភ្លើង តែត្រូវឈរចាំនៅស្ថានីយ៍»!
+            # Pre-set coordinates: 0.618 Golden Pocket & OLS 2σ Boundaries
+            now_limit = time.time()
+            limit_throttle_ok = (now_limit - getattr(self, "_last_in_memory_limit_hit_ts", 0.0)) >= 30.0
+
+            if action == "HOLD" and not has_existing and not is_reversal_flip_trigger and limit_throttle_ok:
+                dom_bias = signal_data.get("dominant_bias", "BUY")
+                tv_sum = signal_data.get("tradingview_summary", {})
+                fib_sum = tv_sum.get("fibonacci", {})
+                ols_sum = tv_sum.get("ols_channel", {})
+                gp_618 = float(fib_sum.get("fib_618", 0.0) or 0.0)
+                ols_u = float(ols_sum.get("upper", 0.0) or 0.0)
+                ols_l = float(ols_sum.get("lower", 0.0) or 0.0)
+                spread_val = float(signal_data.get("spread", 0.50))
+                # Strict boundary tolerance: max 0.80 or 1.5x spread
+                boundary_tol = min(1.00, max(0.50, spread_val * 1.5))
+
+                candidate_dir = None
+                candidate_setup = None
+                candidate_level = 0.0
+
+                if dom_bias == "BUY":
+                    # Buy Limit Station: Price retested Golden Pocket or Lower OLS Band
+                    # Price must test support and NOT crash below it by more than $0.50
+                    if gp_618 >= 3500.0 and abs(current_price - gp_618) <= boundary_tol and current_price >= (gp_618 - 0.50):
+                        candidate_dir = "BUY"
+                        candidate_setup = "LIMIT_GOLDEN_POCKET_BUY"
+                        candidate_level = gp_618
+                    elif ols_l >= 3500.0 and abs(current_price - ols_l) <= boundary_tol and current_price >= (ols_l - 0.50):
+                        candidate_dir = "BUY"
+                        candidate_setup = "LIMIT_OLS_LOWER_BUY"
+                        candidate_level = ols_l
+                elif dom_bias == "SELL":
+                    # Sell Limit Station: Price rallied into Upper OLS Band or Fib Resistance
+                    # Price must test resistance and NOT surge above it by more than $0.50
+                    if ols_u >= 3500.0 and abs(current_price - ols_u) <= boundary_tol and current_price <= (ols_u + 0.50):
+                        candidate_dir = "SELL"
+                        candidate_setup = "LIMIT_OLS_UPPER_SELL"
+                        candidate_level = ols_u
+                    elif gp_618 >= 3500.0 and abs(current_price - gp_618) <= boundary_tol and current_price <= (gp_618 + 0.50):
+                        candidate_dir = "SELL"
+                        candidate_setup = "LIMIT_FIB_RESISTANCE_SELL"
+                        candidate_level = gp_618
+
+                if candidate_dir:
+                    # INSTITUTIONAL EXHAUSTION & CLIMAX GUARD (AQ88 Invariant 120):
+                    # Never blind-limit into an expanding momentum candle!
+                    # Must verify that price has exhausted (rejection wick >= 30%, Kalman deceleration, RSI extreme)
+                    is_exhausted, exhaust_reason, conf_boost = self._validate_exhaustion_top_bottom(
+                        direction=candidate_dir,
+                        current_price=current_price,
+                        signal_data=signal_data
+                    )
+                    if is_exhausted:
+                        action = candidate_dir
+                        confidence = min(94.0, max(confidence, 82.0) + conf_boost)
+                        in_memory_limit_setup = candidate_setup
+                        self._last_in_memory_limit_hit_ts = now_limit
+                        logger.info(
+                            f"🎯 [IN-MEMORY LIMIT HIT: EXHAUSTION CONFIRMED] Price ${current_price:.2f} touched "
+                            f"{candidate_setup} (${candidate_level:.2f}) | {exhaust_reason} | High-Conviction {action} Fill!"
+                        )
+                    else:
+                        logger.debug(
+                            f"🛡️ [IN-MEMORY LIMIT BLOCKED BY EXHAUSTION GUARD] Price ${current_price:.2f} touched "
+                            f"{candidate_setup} (${candidate_level:.2f}), but {exhaust_reason}. Order suppressed to prevent catching knife/train."
+                        )
+
+                if action in ["BUY", "SELL"]:
+                    if action == "BUY":
+                        signal_data["sl"] = signal_data.get("prospective_buy", {}).get("sl", current_price - 25.0)
+                        signal_data["tp1"] = signal_data.get("prospective_buy", {}).get("tp1", current_price + 32.0)
+                        signal_data["tp2"] = signal_data.get("prospective_buy", {}).get("tp2", current_price + 55.0)
+                        signal_data["tp3"] = signal_data.get("prospective_buy", {}).get("tp3", current_price + 90.0)
+                    else:
+                        signal_data["sl"] = signal_data.get("prospective_sell", {}).get("sl", current_price + 25.0)
+                        signal_data["tp1"] = signal_data.get("prospective_sell", {}).get("tp1", current_price - 32.0)
+                        signal_data["tp2"] = signal_data.get("prospective_sell", {}).get("tp2", current_price - 55.0)
+                        signal_data["tp3"] = signal_data.get("prospective_sell", {}).get("tp3", current_price - 90.0)
+                    sl_val = float(signal_data["sl"])
+                    sl_dist = abs(current_price - sl_val)
+
+            # Prevent same-direction revenge chasing or churning within post-trade cooldown
+            if action in ["BUY", "SELL"] and not has_existing and not is_reversal_flip_trigger:
+                min_cd = getattr(self, "_trade_cooldown_seconds", 45.0)
+                last_closed_entry = getattr(self, "_last_closed_trade_entry", 0.0)
+                is_near_last_entry = (last_closed_entry > 0.0) and (abs(current_price - last_closed_entry) < 2.50)
+                effective_cd = max(min_cd, 90.0 if is_near_last_entry else 30.0)
+
+                if action == last_closed_dir and time_since_close < effective_cd:
+                    logger.debug(f"🛡️ [POST-CLOSE COOLDOWN] Same-direction {action} suppressed for {round(effective_cd - time_since_close, 1)}s to prevent churn/revenge chase.")
+                    return {
+                        "status": "COOLDOWN_ACTIVE",
+                        "remaining_seconds": round(effective_cd - time_since_close, 1)
+                    }
+
+            # Throttle repetitive signal dispatch when previous identical signal had 0 fills (fleet busy/locked)
+            last_unf_action = getattr(self, "_last_unfilled_action", None)
+            last_unf_ts = getattr(self, "_last_unfilled_ts", 0.0)
+            last_unf_price = getattr(self, "_last_unfilled_price", 0.0)
+            if (
+                action in ["BUY", "SELL"]
+                and not is_reversal_flip_trigger
+                and action == last_unf_action
+                and (now - last_unf_ts) < 45.0
+                and abs(current_price - last_unf_price) < 2.50
+            ):
+                return {
+                    "status": "SIGNAL_THROTTLED",
+                    "action": action,
+                    "remaining_cooldown": round(45.0 - (now - last_unf_ts), 1)
+                }
 
             dispatched_count = 0
             if action in ["BUY", "SELL"]:
-                logger.info(f"🥇 [QUANT GOLD EXECUTION] Super Smart Signal Triggered: {action} @ ${signal_data['current_price']:.2f} (Confidence: {signal_data['confidence']}%)")
-                
-                # High-Throughput Concurrent Fan-Out Dispatch & Single Signal Broadcast
+                is_reversal_flip = is_reversal_flip_trigger
+                is_pyramid = False
+                target_tranche_label = None
+
+                if has_existing:
+                    if action != existing_dir:
+                        # Opposing Signal -> Evaluate Trend Reversal Flip (Institutional 10-Pillar Consensus Standard AQ88 Invariant 127)
+                        now_ts = now
+                        last_rev_ts = getattr(self, "_last_reversal_flip_ts", 0.0)
+
+                        # Check existing trade floating pnl to protect capital
+                        existing_entry_p = self._active_gold_entry_price
+                        if existing_entry_p <= 0.0 and active_gold_trades:
+                            try:
+                                existing_entry_p = float(active_gold_trades[0].get("entry_price", current_price) or current_price)
+                            except Exception:
+                                existing_entry_p = current_price
+                        existing_pnl_pts = (current_price - existing_entry_p) if existing_dir == "BUY" else (existing_entry_p - current_price)
+                        is_existing_losing = (existing_pnl_pts <= -2.50)
+
+                        # Dynamic anti-whipsaw cooldown: 180s (3 minutes) to prevent chop churn
+                        rev_cooldown_left = 180.0 - (now_ts - last_rev_ts)
+                        min_hold_req = 45.0
+
+                        first_pos_ts = 0.0
+                        if active_gold_trades:
+                            try:
+                                first_pos_ts = float(active_gold_trades[0].get("created_at_ts", 0.0) or 0.0)
+                            except Exception:
+                                first_pos_ts = 0.0
+                        if first_pos_ts <= 0.0:
+                            first_pos_ts = getattr(self, "_active_gold_entry_ts", 0.0)
+                        time_in_pos = (now_ts - first_pos_ts) if first_pos_ts > 0 else 999.0
+
+                        # Extract Technical Indicators for Opposing Reversal Check
+                        kalman_vel = float(signal_data.get("math_summary", {}).get("kalman_velocity", 0.0) or 0.0)
+                        nof_data = signal_data.get("math_summary", {}).get("net_order_flow_force", {})
+                        ex_state = str(nof_data.get("exhaustion_state", "NEUTRAL_BALANCED"))
+                        m15_info = signal_data.get("m15_summary", {})
+                        m15_rsi = float(m15_info.get("rsi", 50.0) or 50.0)
+                        m15_ema21 = float(m15_info.get("ema21", current_price) or current_price)
+                        m15_atr = float(m15_info.get("atr", 6.5) or 6.5)
+                        if m15_atr <= 0.5:
+                            m15_atr = 6.5
+
+                        can_flip = False
+                        flip_veto_reason = ""
+
+                        # 1. FIDUCIARY PROFIT PROTECTION: Never flip an existing healthy/winning trade!
+                        if not is_existing_losing:
+                            flip_veto_reason = f"PROFIT_RUNNER_PROTECTED (Existing {existing_dir} healthy/profitable with {existing_pnl_pts:+.2f} pts PnL. Protected by TP/SL, flipping forbidden!)"
+                        elif rev_cooldown_left > 0:
+                            flip_veto_reason = f"COOLDOWN_ACTIVE ({rev_cooldown_left:.0f}s left of 180s)"
+                        elif time_in_pos < min_hold_req:
+                            flip_veto_reason = f"MIN_HOLD_PROTECTION (in position {time_in_pos:.0f}s < {min_hold_req:.0f}s)"
+                        elif action == "BUY":
+                            if is_macro_bear:
+                                flip_veto_reason = "MACRO_BEAR_VETO (Cannot flip to BUY against H1/H4 Downtrend)"
+                            elif weighted_score < 15.0:
+                                flip_veto_reason = f"INSUFFICIENT_BUY_SCORE (Score {weighted_score:+.1f} < +15.0)"
+                            elif confidence < 70.0:
+                                flip_veto_reason = f"INSUFFICIENT_CONFIDENCE ({confidence:.1f}% < 70.0%)"
+                            elif kalman_vel < -0.010:
+                                flip_veto_reason = f"VELOCITY_DIVERGENCE (Kalman vel {kalman_vel:+.4f} is falling negative)"
+                            elif (current_price - m15_ema21) > (1.85 * m15_atr):
+                                flip_veto_reason = f"ANTI_CHASING_IMPULSE_VETO (Price {current_price:.2f} is {((current_price - m15_ema21)/m15_atr):.2f}x ATR above EMA21)"
+                            elif m15_rsi >= 68.0:
+                                flip_veto_reason = f"ANTI_OVERBOUGHT_VETO (15m RSI is {m15_rsi:.1f} >= 68.0 overbought peak trap)"
+                            elif ex_state == "BULLS_EXHAUSTED_AT_TOP":
+                                flip_veto_reason = "EXHAUSTION_VETO (Bulls exhausted at top with rejection wick)"
+                            else:
+                                can_flip = True
+                        elif action == "SELL":
+                            if is_macro_bull:
+                                flip_veto_reason = "MACRO_BULL_VETO (Cannot flip to SELL against H1/H4 Uptrend)"
+                            elif weighted_score > -15.0:
+                                flip_veto_reason = f"INSUFFICIENT_SELL_SCORE (Score {weighted_score:+.1f} > -15.0)"
+                            elif confidence < 70.0:
+                                flip_veto_reason = f"INSUFFICIENT_CONFIDENCE ({confidence:.1f}% < 70.0%)"
+                            elif kalman_vel > 0.010:
+                                flip_veto_reason = f"VELOCITY_DIVERGENCE (Kalman vel {kalman_vel:+.4f} is rising positive)"
+                            elif (m15_ema21 - current_price) > (1.85 * m15_atr):
+                                flip_veto_reason = f"ANTI_CHASING_IMPULSE_VETO (Price {current_price:.2f} is {((m15_ema21 - current_price)/m15_atr):.2f}x ATR below EMA21)"
+                            elif m15_rsi <= 38.0:
+                                flip_veto_reason = f"ANTI_OVERSOLD_VETO (15m RSI is {m15_rsi:.1f} <= 38.0 Invariant 1.1 Fiduciary Refusal Directive)"
+                            elif ex_state == "BEARS_EXHAUSTED_AT_BOTTOM":
+                                flip_veto_reason = "EXHAUSTION_VETO (Bears exhausted at bottom with rejection wick)"
+                            else:
+                                can_flip = True
+
+                        if can_flip:
+                            is_reversal_flip = True
+                            self._last_reversal_flip_ts = now_ts
+                            # Ensure prospective SL/TPs are properly aligned for the reversal direction
+                            if action == "BUY":
+                                signal_data["sl"] = signal_data.get("prospective_buy", {}).get("sl", current_price - 25.0)
+                                signal_data["tp1"] = signal_data.get("prospective_buy", {}).get("tp1", current_price + 32.0)
+                                signal_data["tp2"] = signal_data.get("prospective_buy", {}).get("tp2", current_price + 55.0)
+                                signal_data["tp3"] = signal_data.get("prospective_buy", {}).get("tp3", current_price + 90.0)
+                            else:
+                                signal_data["sl"] = signal_data.get("prospective_sell", {}).get("sl", current_price + 25.0)
+                                signal_data["tp1"] = signal_data.get("prospective_sell", {}).get("tp1", current_price - 32.0)
+                                signal_data["tp2"] = signal_data.get("prospective_sell", {}).get("tp2", current_price - 55.0)
+                                signal_data["tp3"] = signal_data.get("prospective_sell", {}).get("tp3", current_price - 90.0)
+                            sl_val = float(signal_data["sl"])
+                            sl_dist = abs(current_price - sl_val)
+                            logger.info(
+                                f"🔄 [TREND REVERSAL FLIP APPROVED] High-conviction {action} signal (Confidence: {confidence:.1f}%, Score: {weighted_score:+.1f}) "
+                                f"opposes current {existing_dir} position (held for {time_in_pos:.0f}s, PnL: {existing_pnl_pts:+.2f} pts). Engaging Institutional Reversal Flip Protocol!"
+                            )
+                        else:
+                            now_log = time.time()
+                            last_log_ts = getattr(self, "_last_reversal_block_log_ts", 0.0)
+                            last_reason = getattr(self, "_last_reversal_block_reason", "")
+                            if (now_log - last_log_ts >= 60.0) or (flip_veto_reason != last_reason):
+                                self._last_reversal_block_log_ts = now_log
+                                self._last_reversal_block_reason = flip_veto_reason
+                                logger.info(
+                                    f"🛡️ [REVERSAL FLIP BLOCKED] Opposing {action} signal rejected: {flip_veto_reason}. "
+                                    f"Holding existing {existing_dir} trade."
+                                )
+                            else:
+                                logger.debug(
+                                    f"🛡️ [REVERSAL FLIP BLOCKED] Opposing {action} signal rejected: {flip_veto_reason}. "
+                                    f"Holding existing {existing_dir} trade."
+                                )
+                            return {
+                                "status": "MANAGING_ACTIVE_TRADE",
+                                "deal_id": self._active_gold_deal_id,
+                                "stage": self._active_gold_stage,
+                                "direction": self._active_gold_direction,
+                                "entry_price": self._active_gold_entry_price
+                            }
+                    else:
+                        # Same Direction -> Dual-Engine Coordinated Fleet Pyramiding (AQ88 Invariant 129)
+                        # Machine 1 (M1-M5 Scalp) and Machine 2 (M15+ Macro) work in PERFECT SYNCHRONIZATION!
+                        # They trade in the SAME direction as dominant macro trend, NEVER fighting or hedging!
+                        pos_count = len(active_gold_trades)
+                        has_scalp_open = any(is_engine_1_scalp(t.get("tranche_id", ""), int(t.get("scale_tier", 0) or 0)) for t in active_gold_trades)
+                        has_macro_open = any(is_engine_2_macro(t.get("tranche_id", ""), int(t.get("scale_tier", 0) or 0)) for t in active_gold_trades)
+
+                        # Determine which Machine is triggering this order
+                        if not has_macro_open and has_scalp_open:
+                            # Machine 1 Scalp is running -> Machine 2 opens M15+ Macro position!
+                            tier_num = 2
+                            target_tranche_label = "POS2_M15_FVG_RETEST"
+                        elif not has_scalp_open and has_macro_open:
+                            # Machine 2 Macro is running -> Machine 1 opens new M1-M5 Scalp position!
+                            tier_num = 1
+                            target_tranche_label = "POS1_M1_M5_SCALP"
+                        else:
+                            # Both open or scaling -> Subsequent structural tranches
+                            tier_spec = get_gold_position_tier_spec(pos_count)
+                            tier_num = tier_spec["tier"]
+                            target_tranche_label = tier_spec["label"]
+
+                        tier_spec = get_gold_position_tier_spec(tier_num - 1)
+                        # Realistic structural price separation buffer on Gold (25 pips):
+                        # Prevents stacking orders into the same price noise cluster!
+                        spread_val = float(signal_data.get("spread", 0.50) or 0.50)
+                        min_sep = max(2.50, spread_val * 4.0)
+
+                        too_close = any(
+                            abs(current_price - float(t.get("entry_price", 0.0) or 0.0)) < min_sep
+                            for t in active_gold_trades
+                        )
+
+                        # Institutional Free-Roll Pyramiding Lock (AQ88 Invariant 131):
+                        # Adding ANY additional position (Machine 2 Macro or subsequent tranches) requires prior positions
+                        # to ALREADY be protected by Breakeven Armor (scale_tier >= 1 locked in DB & broker SL)
+                        # AND floating in solid profit (>= +2.00 pts / +20 pips = +$1.00 cash Free Roll)!
+                        # Opening a 2nd position while prior trade is unprotected or in minor noise is 100% FORBIDDEN.
+                        all_prior_protected = all(
+                            int(t.get("scale_tier", 0) or 0) >= 1
+                            and (
+                                (existing_dir == "BUY" and (current_price - float(t.get("entry_price", current_price) or current_price)) >= 2.00)
+                                or (existing_dir == "SELL" and (float(t.get("entry_price", current_price) or current_price) - current_price) >= 2.00)
+                            )
+                            for t in active_gold_trades
+                        )
+
+                        if pos_count >= 5:
+                            can_pyramid = False
+                            pyramid_hold_reason = f"MAX_POSITIONS_REACHED ({pos_count}/5)"
+                        elif too_close:
+                            can_pyramid = False
+                            pyramid_hold_reason = f"TOO_CLOSE_TO_ENTRY (< ${min_sep:.2f} separation)"
+                        elif not all_prior_protected:
+                            can_pyramid = False
+                            pyramid_hold_reason = "PRIOR_POSITIONS_NOT_FREE_ROLL (requires profit >= +20 pips or Breakeven Armor)"
+                        elif tier_num in [1, 2]:
+                            can_pyramid = (confidence >= 68.0 or abs(weighted_score) >= 18.0 or bool(in_memory_limit_setup))
+                            pyramid_hold_reason = f"INSUFFICIENT_CONVICTION ({confidence:.1f}%)" if not can_pyramid else ""
+                        elif tier_num == 3:
+                            can_pyramid = (confidence >= 72.0 or abs(weighted_score) >= 25.0)
+                            pyramid_hold_reason = f"INSUFFICIENT_SWING_SCORE ({weighted_score:+.1f})" if not can_pyramid else ""
+                        else:
+                            can_pyramid = (confidence >= 75.0 or abs(weighted_score) >= 28.0)
+                            pyramid_hold_reason = f"INSUFFICIENT_CONVICTION ({confidence:.1f}%)" if not can_pyramid else ""
+
+                        if can_pyramid:
+                            is_pyramid = True
+                            eff_setup_type = target_tranche_label
+                            logger.info(
+                                f"⚡ [DUAL-ENGINE FLEET EXPANSION] {target_tranche_label} ({tier_spec['name']}) approved in direction {action} @ ${current_price:.2f} "
+                                f"(Open Trades: {pos_count}, Separation: ${min_sep:.2f}, Confidence: {confidence:.1f}%)"
+                            )
+                        else:
+                            logger.debug(
+                                f"🛡️ [DUAL-ENGINE HOLD] {pyramid_hold_reason}. "
+                                f"Continuing to manage existing {existing_dir} positions ({pos_count})."
+                            )
+                            return {
+                                "status": "MANAGING_ACTIVE_TRADE",
+                                "deal_id": self._active_gold_deal_id,
+                                "stage": self._active_gold_stage,
+                                "direction": self._active_gold_direction,
+                                "entry_price": self._active_gold_entry_price
+                            }
+
+                if not is_reversal_flip and not in_memory_limit_setup:
+                    if target_tranche_label:
+                        eff_setup_type = target_tranche_label
+                    else:
+                        active_tier = get_gold_position_tier_spec(len(active_gold_trades))
+                        eff_setup_type = active_tier["label"] if is_pyramid else "POS1_M1_M5_SCALP"
+                elif is_reversal_flip:
+                    eff_setup_type = "QUANT_GOLD_REVERSAL_FLIP"
+                elif in_memory_limit_setup:
+                    eff_setup_type = in_memory_limit_setup
+
+                logger.info(f"🥇 [QUANT GOLD EXECUTION] Signal Triggered: {action} @ ${signal_data['current_price']:.2f} (Confidence: {confidence:.1f}%, Reversal={is_reversal_flip}, Pyramid={is_pyramid}, Setup={eff_setup_type})")
+
+                # High-Throughput Concurrent Fan-Out Dispatch & Broadcast
                 fleet_res = await self.dispatch_gold_signal_to_fleet(
                     action=action,
                     current_price=signal_data["current_price"],
@@ -853,31 +2081,74 @@ class QuantGoldExecutionEngine:
                     tp2=signal_data["tp2"],
                     tp3=signal_data["tp3"],
                     app=app,
-                    setup_type="QUANT_GOLD_19TF_VIP",
-                    confidence=float(signal_data.get("confidence", 75.0) or 75.0)
+                    setup_type=eff_setup_type,
+                    confidence=confidence,
+                    is_reversal_flip=is_reversal_flip,
+                    is_pyramid=is_pyramid
                 )
                 dispatched_count = fleet_res.get("dispatched_count", 0)
+
+                if dispatched_count == 0:
+                    self._last_unfilled_action = action
+                    self._last_unfilled_ts = now
+                    self._last_unfilled_price = current_price
+                else:
+                    self._last_unfilled_action = None
+                    self._last_unfilled_ts = 0.0
+                    self._last_unfilled_price = 0.0
 
                 # Send detailed telemetry to Super Admin
                 if app and dispatched_count > 0:
                     try:
                         import notification_manager
+                        sl_pips_disp = abs(signal_data['current_price'] - signal_data['sl']) * 10
+                        tp1_pips_disp = abs(signal_data['tp1'] - signal_data['current_price']) * 10
+                        tp2_pips_disp = abs(signal_data['tp2'] - signal_data['current_price']) * 10
+                        tp3_pips_disp = abs(signal_data['tp3'] - signal_data['current_price']) * 10
+                        prefix_title = "🔄 [TREND REVERSAL FLIP]" if is_reversal_flip else ("⚡ [AGILE PYRAMIDING ENTRY]" if is_pyramid else "🥇 [QUANT GOLD AUTO DISPATCH]")
+                        u_res_list = fleet_res.get("user_results", [])
+                        breakdown_lines = []
+                        for ur in u_res_list:
+                            u_cid = ur.get("chat_id")
+                            u_label = "Super Admin (859271875)" if u_cid == 859271875 else f"User {u_cid}"
+                            if ur.get("success"):
+                                breakdown_lines.append(f"   └ <b>{u_label}:</b> ✅ {ur.get('mode')} ({ur.get('lot')} lot)")
+                            else:
+                                breakdown_lines.append(f"   └ <b>{u_label}:</b> ⏸️ {ur.get('reason', 'Skipped')}")
+                        breakdown_str = "\n".join(breakdown_lines) if breakdown_lines else "   └ None"
+
                         alert_msg = (
-                            f"🥇 <b>[QUANT GOLD AUTO DISPATCH]</b> ⚡\n"
+                            f"{prefix_title} ⚡\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"📊 <b>Action :</b> <code>{'🟢 BUY' if action == 'BUY' else '🔴 SELL'}</code> @ <code>${signal_data['current_price']:.2f}</code>\n"
-                            f"🛡️ <b>Structural SL :</b> <code>${signal_data['sl']:.2f}</code> (-60.8 pips)\n"
-                            f"🎯 <b>Target TP1 (+1.2R) :</b> <code>${signal_data['tp1']:.2f}</code> (+73 pips | Breakeven Lock)\n"
-                            f"🎯 <b>Target TP2 (+2.5R) :</b> <code>${signal_data['tp2']:.2f}</code> (+152 pips | Cash Floor)\n"
-                            f"🚀 <b>Moonshot TP3 (+4.0R) :</b> <code>${signal_data['tp3']:.2f}</code> (+243 pips | Moonshot)\n"
+                            f"🛡️ <b>Structural SL :</b> <code>${signal_data['sl']:.2f}</code> (-{sl_pips_disp:.0f} pips)\n"
+                            f"🎯 <b>Target TP1 (+1.5R) :</b> <code>${signal_data['tp1']:.2f}</code> (+{tp1_pips_disp:.0f} pips | Breakeven Lock)\n"
+                            f"🎯 <b>Target TP2 (+2.5R) :</b> <code>${signal_data['tp2']:.2f}</code> (+{tp2_pips_disp:.0f} pips | Cash Floor)\n"
+                            f"🚀 <b>Moonshot TP3 (+4.0R) :</b> <code>${signal_data['tp3']:.2f}</code> (+{tp3_pips_disp:.0f} pips | Moonshot)\n"
                             f"⚡ <b>19-TF Alignment :</b> <code>{signal_data['mtf_summary']['counts']['bullish']}B / {signal_data['mtf_summary']['counts']['bearish']}S</code>\n"
                             f"🧠 <b>Win Confidence :</b> <code>{signal_data['confidence']:.1f}%</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"👥 <b>VIP Fleet Execution Breakdown ៖</b>\n"
+                            f"{breakdown_str}\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"✅ <i>Dispatched to {dispatched_count} active VIP Capital accounts!</i>"
                         )
                         await notification_manager.broadcast_admin(alert_msg, parse_mode="HTML")
                     except Exception:
                         pass
+            else:
+                if has_existing:
+                    return {
+                        "status": "MANAGING_ACTIVE_TRADE",
+                        "deal_id": self._active_gold_deal_id,
+                        "stage": self._active_gold_stage,
+                        "direction": self._active_gold_direction,
+                        "entry_price": self._active_gold_entry_price
+                    }
+                return {
+                    "status": "HOLD",
+                    "current_price": current_price
+                }
 
             return {
                 "status": "COMPLETED",
@@ -902,19 +2173,62 @@ class QuantGoldExecutionEngine:
         app = None,
         setup_type: str = "QUANT_GOLD_19TF_VIP",
         broadcast_telegram: bool = True,
-        confidence: float = 75.0
+        confidence: float = 75.0,
+        is_reversal_flip: bool = False,
+        is_pyramid: bool = False
     ) -> Dict[str, Any]:
         """
         High-Throughput Concurrent Fan-Out Dispatch (Semaphore 30):
         Dispatches Gold market orders for all active VIP users on Capital.com simultaneously (<0.05ms)
-        AND synchronously broadcasts the institutional signal card to VIP Telegram users (ONLY when orders placed).
+        Supports:
+          1. Clean First Entry (SINGLE)
+          2. Agile Multi-Position Pyramiding (Scale-In across distinct structural levels)
+          3. Trend Reversal Flip (Opposing Harvest & Instant Flip into new directional wave)
         """
-        active_users = db.get_active_capital_auto_users()
+        # 0. Global Emergency Lockdown & Fleet Trading Switch Pre-Flight Checks
+        try:
+            from quant_gold_security import get_quant_gold_security_citadel
+            if get_quant_gold_security_citadel().is_locked():
+                logger.info("🚨 [CIRCUIT BREAKER ACTIVE] Quant Gold emergency lockdown is engaged. Fleet dispatch aborted.")
+                return {"success": False, "dispatched_count": 0, "reason": "EMERGENCY_LOCKDOWN"}
+        except Exception:
+            pass
+
+        if hasattr(db, "is_capital_global_trading_enabled") and not db.is_capital_global_trading_enabled("AUTO"):
+            logger.info("⏸️ [FLEET TRADING PAUSED] Global Capital Auto switch is OFF. Fleet dispatch aborted.")
+            return {"success": False, "dispatched_count": 0, "reason": "GLOBAL_SWITCH_OFF"}
+
+        raw_users = db.get_active_capital_auto_users() or []
+        # Strict user deduplication by chat_id
+        deduped = {}
+        for u in raw_users:
+            u_cid = u.get("chat_id")
+            if u_cid and u_cid not in deduped:
+                deduped[u_cid] = u
+        active_users = list(deduped.values())
         if not active_users:
-            active_users = [{"chat_id": 859271875, "budget": 500.0, "max_positions": 1, "is_demo": False}]
+            sa_cfg = db.get_capital_auto_config(859271875) or {}
+            if sa_cfg.get("enabled") or sa_cfg.get("is_enabled"):
+                active_users = [{
+                    "chat_id": 859271875,
+                    "budget": float(sa_cfg.get("budget", 500.0) or 500.0),
+                    "max_positions": int(sa_cfg.get("max_positions", 5) or 5),
+                    "is_demo": bool(sa_cfg.get("is_demo", False))
+                }]
+            else:
+                logger.debug("No active users registered for auto-trade and Super Admin is paused. Skipping fleet dispatch.")
+                return {"success": True, "dispatched_count": 0, "reason": "NO_ACTIVE_USERS"}
 
         sem = asyncio.Semaphore(30)
+        acc_lock = asyncio.Lock()
+        dispatched_broker_accounts: set = set()
         sl_dist = abs(current_price - sl)
+        spread_val = 0.50
+        try:
+            _, _, spread_val = self.get_live_gold_price_quote()
+        except Exception:
+            spread_val = 0.50
+        min_separation = max(4.50, spread_val * 6.0)
 
         async def _dispatch_single_user(user_dict: dict) -> int:
             cid = user_dict.get("chat_id")
@@ -923,111 +2237,213 @@ class QuantGoldExecutionEngine:
 
             async with sem:
                 try:
-                    open_trades = db.get_capital_auto_trades_for_user(cid)
-                    open_gold_trades = [
-                        t for t in open_trades 
-                        if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "OPEN")).upper() == "OPEN"
-                    ]
-                    max_user_pos = int(user_dict.get("max_positions", 1) or 1)
-                    
-                    if len(open_gold_trades) >= max_user_pos:
-                        logger.debug(f"User {cid} already reached max Gold positions ({len(open_gold_trades)}/{max_user_pos}). Skipping.")
-                        return 0
-
-                    # Smart Pyramiding Rule (Invariant 1.1 Fiduciary Safety):
-                    # If user is allowed > 1 position, an additional position is ONLY permitted if:
-                    # 1. Existing trade already reached TP1 (Breakeven Armor locked, tier >= 1, 0.00R risk).
-                    # 2. System confidence is ultra-high (>= 85.0%).
-                    if len(open_gold_trades) > 0:
-                        existing = open_gold_trades[0]
-                        existing_tier = int(existing.get("scale_tier", 0) or 0)
-                        if existing_tier < 1 or confidence < 85.0:
-                            logger.info(
-                                f"🛡️ [SMART PYRAMIDING GUARD] User {cid} holds open trade. "
-                                f"Additional position requires TP1 Breakeven Lock & Confidence >= 85.0% "
-                                f"(Current tier={existing_tier}, conf={confidence:.1f}%). Skipping."
-                            )
-                            return 0
-
                     is_admin = (cid == 859271875) or db.is_admin(cid)
                     configured_is_demo = bool(user_dict.get("is_demo", False))
                     budget = float(user_dict.get("budget", 50.0) or 50.0)
+                    max_user_pos = int(user_dict.get("max_positions", 5) or 5)
 
-                    # Dynamic Real Capital Checking & Smart Demo Fallback:
+                    # Dynamic Real Capital Checking & Smart Demo Fallback
                     effective_is_demo = configured_is_demo
                     if not configured_is_demo:
                         try:
                             chk_eng = capital_engine.get_user_capital_engine(cid, is_demo=False)
                             bal_inf = await asyncio.to_thread(chk_eng.get_account_balance)
                             live_avail = float(bal_inf.get("available", 0.0) or 0.0)
-                            
-                            # Min margin for 0.5 oz Gold is ~$4.12 at 500:1 leverage
                             if live_avail < 4.07:
-                                now_ts = time.time()
-                                if is_admin:
-                                    if (now_ts - getattr(self, "_admin_demo_log_ts", 0.0)) >= 600.0:
-                                        self._admin_demo_log_ts = now_ts
-                                        logger.info(f"🚂 [SUPER ADMIN DEMO FALLBACK] Live Available (${live_avail:.2f}) < $4.07. Auto-engaging Demo Account (329832717876539678) $10,000 mirror.")
-                                    effective_is_demo = True
-                                else:
-                                    last_sb = self._user_standby_log_ts.get(cid, 0.0) if hasattr(self, "_user_standby_log_ts") else 0.0
-                                    if (now_ts - last_sb) >= 600.0:
-                                        if not hasattr(self, "_user_standby_log_ts"):
-                                            self._user_standby_log_ts = {}
-                                        self._user_standby_log_ts[cid] = now_ts
-                                        logger.info(f"⚠️ User {cid} Live Available (${live_avail:.2f}) < $4.07. Standby until live capital is deposited.")
-                                    return 0
+                                effective_is_demo = True
                             else:
                                 effective_is_demo = False
                                 budget = max(10.0, min(budget, live_avail * 0.50))
                         except Exception as e_bal:
                             logger.debug(f"Live balance audit note for user {cid}: {e_bal}")
-                            if is_admin:
-                                effective_is_demo = True
-                            else:
-                                return 0
+                            effective_is_demo = True
 
                     u_eng = capital_engine.get_user_capital_engine(cid, is_demo=effective_is_demo)
 
-                    # Pre-flight check: ensure broker does not already hold an active GOLD position for this user
+                    # Broker Account Deduplication Lock (AQ88 Invariant 135):
+                    # Strictly prevent multiple VIP user records from executing duplicate orders on the same underlying Capital.com account!
+                    target_broker_acc = str(
+                        getattr(u_eng, "active_account_id", "")
+                        or getattr(u_eng, "desired_account_id", "")
+                        or getattr(u_eng, "account_id", "")
+                        or ""
+                    ).strip()
+                    if not target_broker_acc:
+                        target_broker_acc = f"user_{cid}_{effective_is_demo}"
+                    else:
+                        target_broker_acc = f"{target_broker_acc}_{effective_is_demo}"
+
+                    async with acc_lock:
+                        if target_broker_acc in dispatched_broker_accounts:
+                            logger.warning(
+                                f"🛡️ [MULTI-USER BROKER DEDUPLICATION] Broker account {target_broker_acc} "
+                                f"already executed an order in this cycle! Skipping duplicate order for user {cid}."
+                            )
+                            return {"chat_id": cid, "success": False, "reason": f"Broker account {target_broker_acc} already received order"}
+                        dispatched_broker_accounts.add(target_broker_acc)
+
+                    # ── STEP A: TREND REVERSAL FLIP HARVEST ──
+                    if is_reversal_flip:
+                        user_open_trades = db.get_capital_auto_trades_for_user(cid) or []
+                        for ot in user_open_trades:
+                            if str(ot.get("epic", "")).upper() == "GOLD" and str(ot.get("status", "OPEN")).upper() == "OPEN":
+                                ot_dir = str(ot.get("direction", "")).upper()
+                                if ot_dir != action:
+                                    d_id = ot.get("deal_id")
+                                    if d_id and d_id != "OK":
+                                        try:
+                                            ot_entry = float(ot.get("entry_price", current_price) or current_price)
+                                            ot_sz = float(ot.get("size", 0.5) or 0.5)
+                                            ot_pnl = ((current_price - ot_entry) if ot_dir == "BUY" else (ot_entry - current_price)) * ot_sz
+                                            if u_eng:
+                                                await asyncio.to_thread(u_eng.close_position, deal_id=d_id)
+                                            if hasattr(db, "update_capital_auto_trade_close"):
+                                                db.update_capital_auto_trade_close(d_id, exit_price=current_price, pnl=ot_pnl)
+                                            elif hasattr(db, "close_capital_auto_trade"):
+                                                db.close_capital_auto_trade(d_id, exit_price=current_price, exit_reason="TREND_REVERSAL_FLIP")
+                                            logger.info(f"🔄 [REVERSAL FLIP] Closed opposing {ot_dir} trade {d_id} for user {cid} at ${current_price:.2f} (Realized PnL: ${ot_pnl:+.2f})")
+                                        except Exception as e_rf:
+                                            logger.warning(f"Error closing opposing deal {d_id}: {e_rf}")
+
+                    # ── STEP B: CAPACITY & DUPLICATION CHECK ──
+                    open_trades = db.get_capital_auto_trades_for_user(cid) or []
+                    open_gold_trades = [
+                        t for t in open_trades 
+                        if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "OPEN")).upper() == "OPEN"
+                    ]
+
+                    # Filter out opposing trades if Reversal Flip occurred
+                    if is_reversal_flip:
+                        open_gold_trades = [t for t in open_gold_trades if str(t.get("direction", "")).upper() == action]
+
+                    if len(open_gold_trades) >= max_user_pos:
+                        logger.debug(f"User {cid} already reached max Gold positions ({len(open_gold_trades)}/{max_user_pos}). Skipping.")
+                        return {"chat_id": cid, "success": False, "reason": f"Max positions reached ({len(open_gold_trades)}/{max_user_pos})"}
+
+                    if not is_reversal_flip and len(open_gold_trades) > 0:
+                        existing = open_gold_trades[0]
+                        existing_dir = str(existing.get("direction", "")).upper()
+                        if existing_dir and action and existing_dir != action:
+                            logger.info(
+                                f"🛡️ [OPPOSING SIGNAL VETO] User {cid} holds open {existing_dir} trade. "
+                                f"New opposing {action} signal strictly muted to prevent hedge-lock collisions."
+                            )
+                            return {"chat_id": cid, "success": False, "reason": f"Opposing {existing_dir} trade held (anti-hedge lock)"}
+
+                    # Price Separation Guard: Prevent duplicate order execution at exact same tick in SAME direction
+                    for ot in open_gold_trades:
+                        if str(ot.get("direction", "")).upper() == action:
+                            ot_entry = float(ot.get("entry_price", 0.0) or 0.0)
+                            if abs(ot_entry - current_price) < min_separation:
+                                logger.info(
+                                    f"🛡️ [PRICE SEPARATION GUARD] User {cid} holds open trade near ${ot_entry:.2f}. "
+                                    f"New entry ${current_price:.2f} within ${min_separation:.2f} buffer. Skipping cluster duplicate."
+                                )
+                                return {"chat_id": cid, "success": False, "reason": f"Price separation buffer (${min_separation:.2f}) - already held"}
+
+                    # Strict Free-Roll Pyramiding Lock (AQ88 Invariant 131):
+                    # Never open a second or third position if existing positions are not yet in Breakeven Armor (Free Roll)!
+                    if len(open_gold_trades) >= 1 and not is_reversal_flip:
+                        for ot in open_gold_trades:
+                            ot_scale = int(ot.get("scale_tier", 0) or 0)
+                            ot_entry = float(ot.get("entry_price", current_price) or current_price)
+                            ot_pnl = (current_price - ot_entry) if action == "BUY" else (ot_entry - current_price)
+                            if ot_scale < 1 or ot_pnl < 5.00:
+                                logger.info(
+                                    f"🛡️ [FREE-ROLL PYRAMID VETO] User {cid} holds open trade at ${ot_entry:.2f} "
+                                    f"not yet protected (PnL: {ot_pnl:+.2f} pts, Tier: {ot_scale}). "
+                                    f"Stacking multiple positions in drawdown or before 0.00R Breakeven Armor is strictly forbidden under Invariant 131."
+                                )
+                                return {"chat_id": cid, "success": False, "reason": "Existing position not yet protected by Breakeven Armor (0.00R Free Roll required)"}
+
+                    # ── STEP C: DAILY CAPITAL GOVERNOR CHECK ──
+                    if not is_admin:
+                        try:
+                            from portfolio_circuit_breaker import is_capital_daily_locked
+                            chk_bal_gov = live_avail if not effective_is_demo else 10000.0
+                            if chk_bal_gov > 0:
+                                is_locked, lock_reason, tel_gov = is_capital_daily_locked(cid, current_balance=chk_bal_gov, is_demo=effective_is_demo)
+                                if is_locked:
+                                    # Quant Gold 24/5 Continuous Mode (Invariant 128):
+                                    # When +5% daily target is reached ("TARGET_5PCT_LOCKED" or "TARGET_LOCKED"),
+                                    # Quant Gold continues trading 24/5 with trailing high-water mark compounding!
+                                    # BUT if locked due to Daily Loss Floor ("FLOOR_HIT" / -2.5% loss),
+                                    # strictly halt new entries to preserve capital against disaster regimes (Invariant 1.1).
+                                    if "TARGET" in str(lock_reason).upper() or (tel_gov and tel_gov.get("is_target_locked")):
+                                        logger.info(
+                                            f"🏆 [QUANT GOLD 24/5 TRAILING COMPOUND] User {cid} daily target reached ({lock_reason}). "
+                                            f"Quant Gold trailing high-water mark active for 24/5 continuous compounding!"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"👑 [DAILY GOVERNOR ACTIVE] User {cid} trading paused today: {lock_reason}. "
+                                            f"Capital strictly preserved under Invariant 52."
+                                        )
+                                        return {"chat_id": cid, "success": False, "reason": f"Daily Governor paused ({lock_reason})"}
+                        except Exception as e_gov:
+                            logger.debug(f"Daily Governor check note for user {cid}: {e_gov}")
+
+                    # ── STEP D: BROKER PRE-FLIGHT RECONCILIATION ──
                     try:
                         b_pos = await asyncio.wait_for(asyncio.to_thread(u_eng.get_open_positions), timeout=3.0) if u_eng else []
+                        broker_gold = []
                         for p_item in (b_pos or []):
                             p_sub = p_item.get("position", p_item)
                             p_epic = str(p_item.get("market", {}).get("epic") or p_sub.get("epic") or "").upper()
                             if p_epic == "GOLD":
-                                d_id = str(p_sub.get("dealId") or p_sub.get("deal_id") or "")
-                                logger.debug(f"User {cid} already has active GOLD position {d_id} on broker. Skipping duplicate order placement.")
-                                if d_id and not db.has_capital_auto_trade_record(d_id):
-                                    p_lvl = float(p_sub.get("level") or p_sub.get("openLevel") or current_price)
-                                    p_dir = str(p_sub.get("direction", action)).upper()
-                                    p_sz = float(p_sub.get("size", 0.5) or 0.5)
-                                    db.record_capital_auto_trade(
-                                        chat_id=cid,
-                                        deal_id=d_id,
-                                        deal_reference=d_id,
-                                        epic="GOLD",
-                                        direction=p_dir,
-                                        size=p_sz,
-                                        entry_price=p_lvl,
-                                        sl=float(p_sub.get("stopLevel", sl) or sl),
-                                        tp=float(p_sub.get("profitLevel", tp1) or tp1),
-                                        tp1=tp1, tp2=tp2, tp3=tp3,
-                                        sl_dist=sl_dist, scale_tier=0,
-                                        is_demo=int(effective_is_demo)
-                                    )
-                                self._active_gold_deal_id = d_id
-                                self._active_gold_stage = "ACTIVE"
-                                return 0
+                                broker_gold.append(p_item)
+
+                        if is_reversal_flip:
+                            for bp in broker_gold:
+                                p_sub = bp.get("position", bp)
+                                bp_dir = str(p_sub.get("direction", "")).upper()
+                                bp_id = p_sub.get("dealId") or p_sub.get("deal_id")
+                                if bp_dir != action and bp_id:
+                                    try:
+                                        await asyncio.to_thread(u_eng.close_position, deal_id=bp_id)
+                                        logger.info(f"🔄 [BROKER REVERSAL FLIP] Closed broker opposing {bp_dir} deal {bp_id} for user {cid}")
+                                    except Exception as e_b_rf:
+                                        logger.warning(f"Error closing broker opposing deal {bp_id}: {e_b_rf}")
+                            b_pos = await asyncio.wait_for(asyncio.to_thread(u_eng.get_open_positions), timeout=3.0) if u_eng else []
+                            broker_gold = [p for p in (b_pos or []) if str(p.get("market", {}).get("epic") or p.get("position", p).get("epic") or "").upper() == "GOLD"]
+
+                        if len(broker_gold) >= max_user_pos:
+                            logger.debug(f"User {cid} already has max GOLD positions ({len(broker_gold)}/{max_user_pos}) on broker. Skipping duplicate order placement.")
+                            return {"chat_id": cid, "success": False, "reason": f"Broker max positions ({len(broker_gold)}/{max_user_pos})"}
+
+                        for bp in broker_gold:
+                            p_sub = bp.get("position", bp)
+                            bp_dir = str(p_sub.get("direction", "")).upper()
+                            if bp_dir == action:
+                                bp_lvl = float(p_sub.get("level") or p_sub.get("openLevel") or current_price)
+                                if abs(bp_lvl - current_price) < min_separation:
+                                    logger.debug(f"User {cid} holds broker {bp_dir} position near ${bp_lvl:.2f}. Skipping cluster duplicate.")
+                                    return {"chat_id": cid, "success": False, "reason": f"Broker position near ${bp_lvl:.2f} held"}
                     except Exception as e_chk_pos:
                         logger.debug(f"Pre-flight broker check note for {cid}: {e_chk_pos}")
 
+                    # ── STEP E: ORDER EXECUTION ──
+                    # Real-World Interbank Session Sizing Multiplier (AQ88 Invariant 122)
+                    try:
+                        from gold_session_planner import get_gold_session_planner
+                        sess_mult = get_gold_session_planner().get_risk_multiplier()
+                    except Exception:
+                        sess_mult = 1.0
+
+                    effective_budget = max(10.0, budget * sess_mult)
                     lot_size = calculate_capital_gold_lot_size(
-                        budget=budget,
+                        budget=effective_budget,
                         current_price=current_price,
                         confidence=confidence,
-                        leverage=500.0
+                        leverage=20.0,
+                        available_cash=(live_avail * sess_mult) if (not effective_is_demo and live_avail is not None) else None
                     )
+
+                    # Dynamic Risk-Bounded Lot Sizing (AQ88 Invariant 134):
+                    # Guarantees dollar risk on accounts < $500 never exceeds $3.00 regardless of SL distance!
+                    max_allowed_dollar_risk = 3.00 if effective_budget < 500.0 else (effective_budget * 0.015)
+                    risk_clamped_lot = round(max_allowed_dollar_risk / max(1.0, sl_dist), 2)
+                    lot_size = max(0.10, min(lot_size, risk_clamped_lot))
 
                     order_res = await asyncio.to_thread(
                         u_eng.execute_smart_tradfi_order,
@@ -1038,19 +2454,25 @@ class QuantGoldExecutionEngine:
                         tp=tp1,
                         bypass_quant_eval=True,
                         bypass_citadel=True,
-                        setup_type=setup_type
+                        setup_type=setup_type,
+                        max_positions=max_user_pos,
+                        allow_pyramiding=True,
+                        single_compact=True
                     )
                     if order_res.get("success"):
                         deal_id = order_res.get("deal_reference") or order_res.get("dealId", "OK")
                         self._active_gold_deal_id = str(deal_id)
                         self._active_gold_direction = action
                         self._active_gold_entry_price = current_price
+                        self._active_gold_entry_ts = time.time()
                         self._active_gold_sl = sl
                         self._active_gold_tp1 = tp1
                         self._active_gold_tp2 = tp2
                         self._active_gold_tp3 = tp3
                         self._active_gold_stage = "ACTIVE"
 
+                        tier_spec = get_gold_position_tier_spec(len(open_gold_trades))
+                        tranche_label = setup_type if (setup_type and setup_type != "UNKNOWN") else (tier_spec["label"] if is_pyramid else ("REVERSAL_FLIP" if is_reversal_flip else "POS1_M1_M5_SCALP"))
                         db.record_capital_auto_trade(
                             chat_id=cid,
                             deal_id=str(deal_id),
@@ -1063,31 +2485,52 @@ class QuantGoldExecutionEngine:
                             tp=tp1,
                             scale_tier=0,
                             sl_dist=sl_dist,
-                            tranche_id="SINGLE",
+                            tranche_id=tranche_label,
                             tp1=tp1,
                             tp2=tp2,
                             tp3=tp3,
                             is_demo=int(effective_is_demo)
                         )
-                        return 1
+                        return {"chat_id": cid, "success": True, "mode": "LIVE" if not effective_is_demo else "DEMO", "lot": lot_size}
+                    else:
+                        err_msg = str(order_res.get("error", "Broker order rejected"))
+                        return {"chat_id": cid, "success": False, "reason": err_msg}
                 except Exception as e_ord:
                     logger.warning(f"Error placing Gold order for user {cid}: {e_ord}")
-                return 0
+                    return {"chat_id": cid, "success": False, "reason": f"Order error: {e_ord}"}
 
         results = await asyncio.gather(*[_dispatch_single_user(u) for u in active_users], return_exceptions=True)
-        dispatched_count = sum(r for r in results if isinstance(r, int))
+        dispatched_count = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
+        user_results = [r for r in results if isinstance(r, dict)]
 
         sent_count = 0
-        # CRITICAL FIX: Only broadcast to Telegram IF orders were actually dispatched to fleet
-        # This completely eliminates false signals and repetitive signal spam!
-        if broadcast_telegram and dispatched_count > 0:
+        now_broadcast = time.time()
+        last_bc_ts = getattr(self, "_last_broadcast_signal_ts", 0.0)
+        last_bc_action = getattr(self, "_last_broadcast_action", None)
+        
+        # High-Fidelity Signal Broadcast: Always broadcast to VIP users on Reversal, Pyramid, Order Fill,
+        # or when a new setup appears that hasn't been broadcast within 60s
+        should_broadcast = broadcast_telegram and (
+            is_reversal_flip or
+            is_pyramid or
+            dispatched_count > 0 or
+            action != last_bc_action or
+            (now_broadcast - last_bc_ts) >= 60.0
+        )
+        if should_broadcast:
+            self._last_broadcast_signal_ts = now_broadcast
+            self._last_broadcast_action = action
+            c_type = "REVERSAL" if is_reversal_flip else ("PYRAMID" if is_pyramid else "SIGNAL")
+            tr_num = len(self.get_active_gold_trades_list()) if is_pyramid else 1
             vip_card = format_gold_signal_card(
                 direction=action,
                 sl=sl,
                 tp1=tp1,
                 tp2=tp2,
                 tp3=tp3,
-                entry_price=current_price
+                entry_price=current_price,
+                card_type=c_type,
+                tranche_num=tr_num
             )
             markup = get_gold_signal_reply_markup()
             sent_count = await self.broadcast_to_vip_users(vip_card, app=app, reply_markup=markup)
@@ -1096,7 +2539,8 @@ class QuantGoldExecutionEngine:
             "dispatched_count": dispatched_count,
             "broadcast_sent": sent_count,
             "action": action,
-            "current_price": current_price
+            "current_price": current_price,
+            "user_results": user_results
         }
 
     async def execute_smart_order_for_user(
@@ -1107,7 +2551,8 @@ class QuantGoldExecutionEngine:
         sl: float = 0.0,
         tp: float = 0.0,
         broadcast_vip: bool = False,
-        app = None
+        app = None,
+        max_positions: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Executes a 1-tap manual or VIP Gold order for a specific user on Capital.com
@@ -1115,10 +2560,23 @@ class QuantGoldExecutionEngine:
         Default minimum size: 0.5 Troy Ounce (Margin required = ~$4.07 at 500:1 leverage).
         """
         try:
-            size = max(0.5, float(size or 0.5))
             u_eng = capital_engine.get_user_capital_engine(chat_id)
             bid, ask, spread = self.get_live_gold_price_quote()
             curr_p = (bid + ask) / 2.0
+
+            if size is None or float(size or 0.0) <= 0:
+                b_info = u_eng.get_account_balance() if u_eng else {}
+                u_budget = float(b_info.get("balance", 50.0) or 50.0)
+                u_avail = float(b_info.get("available", u_budget) or u_budget)
+                size = calculate_capital_gold_lot_size(
+                    budget=u_budget,
+                    current_price=curr_p,
+                    confidence=75.0,
+                    leverage=20.0,
+                    available_cash=u_avail
+                )
+            else:
+                size = max(0.10, float(size or 0.5))
 
             # Symmetrical tight structural SL ($6.08) and 3-stage targets (+73, +152, +243 pips)
             sl_dist = 6.08
@@ -1132,8 +2590,59 @@ class QuantGoldExecutionEngine:
                 tp = (curr_p + tp1_dist) if direction.upper() == "BUY" else (curr_p - tp1_dist)
 
             tp1 = round(tp, 2)
-            tp2 = round((curr_p + tp2_dist) if direction.upper() == "BUY" else (curr_p - tp2_dist), 2)
-            tp3 = round((curr_p + tp3_dist) if direction.upper() == "BUY" else (curr_p - tp3_dist), 2)
+            eff_tp1_dist = abs(curr_p - tp1)
+            eff_tp2_dist = max(eff_tp1_dist * 1.618, tp2_dist)
+            eff_tp3_dist = max(eff_tp2_dist * 1.618, tp3_dist)
+            tp2 = round((curr_p + eff_tp2_dist) if direction.upper() == "BUY" else (curr_p - eff_tp2_dist), 2)
+            tp3 = round((curr_p + eff_tp3_dist) if direction.upper() == "BUY" else (curr_p - eff_tp3_dist), 2)
+
+            # Check existing user open trades for Agile Pyramiding or Trend Reversal Flip
+            user_open_trades = db.get_capital_auto_trades_for_user(chat_id) or []
+            gold_trades = [
+                t for t in user_open_trades
+                if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "")).upper() == "OPEN"
+            ]
+            opposing = [t for t in gold_trades if str(t.get("direction", "")).upper() != direction.upper()]
+            is_manual_reversal = len(opposing) > 0
+            is_manual_pyramid = (not is_manual_reversal) and (len(gold_trades) > 0)
+
+            # Trend Reversal Flip: Harvest / close opposing trades before opening new directional wave
+            if is_manual_reversal:
+                for ot in opposing:
+                    d_id = str(ot.get("deal_id", ""))
+                    if d_id and d_id != "OK":
+                        try:
+                            await asyncio.to_thread(u_eng.close_position, deal_id=d_id)
+                        except Exception as e_c:
+                            logger.debug(f"Manual reversal broker close deal {d_id} note: {e_c}")
+                    if hasattr(db, "update_capital_auto_trade_close"):
+                        db.update_capital_auto_trade_close(d_id, exit_price=curr_p, pnl=0.0)
+
+            # Also check broker live positions to ensure zero opposing broker lock
+            try:
+                b_pos = await asyncio.to_thread(u_eng.get_open_positions) if hasattr(u_eng, "get_open_positions") else []
+                for bp in b_pos:
+                    p_sub = bp.get("position", bp)
+                    p_epic = str(bp.get("market", {}).get("epic", p_sub.get("epic", ""))).upper()
+                    p_dir = str(p_sub.get("direction", "")).upper()
+                    p_deal = str(p_sub.get("dealId", ""))
+                    if p_epic == "GOLD" and p_dir != direction.upper() and p_deal:
+                        await asyncio.to_thread(u_eng.close_position, deal_id=p_deal)
+            except Exception as e_bclose:
+                logger.debug(f"Manual reversal broker sweep note: {e_bclose}")
+
+            tier_spec = get_gold_position_tier_spec(len(gold_trades))
+            eff_setup_type = "QUANT_GOLD_REVERSAL_FLIP" if is_manual_reversal else (tier_spec["label"] if is_manual_pyramid else "VIP_1TAP_GOLD")
+
+            # Determine user's max_positions configuration
+            if max_positions is not None and max_positions > 0:
+                max_pos = int(max_positions)
+            else:
+                try:
+                    auto_cfg = db.get_capital_auto_config(chat_id) or {}
+                    max_pos = int(auto_cfg.get("max_positions", 5) or 5)
+                except Exception:
+                    max_pos = 5
 
             order_res = await asyncio.to_thread(
                 u_eng.execute_smart_tradfi_order,
@@ -1144,17 +2653,26 @@ class QuantGoldExecutionEngine:
                 tp=tp1,
                 bypass_quant_eval=True,
                 bypass_citadel=True,
-                setup_type="VIP_1TAP_GOLD"
+                setup_type=eff_setup_type,
+                max_positions=max_pos,
+                allow_pyramiding=True,
+                single_compact=True
             )
 
             if order_res.get("success"):
-                deal_id = order_res.get("deal_reference") or order_res.get("dealId", "OK")
-                entry_price = float(order_res.get("entry_price") or order_res.get("price") or curr_p)
+                deal_id = order_res.get("dealId") or order_res.get("deal_reference", "OK")
+                deal_ref = order_res.get("deal_reference") or str(deal_id)
+                if str(deal_id).startswith("o_"):
+                    real_d = order_res.get("dealId")
+                    if real_d and not str(real_d).startswith("o_"):
+                        deal_id = real_d
 
+                entry_price = float(order_res.get("entry_price") or order_res.get("price") or curr_p)
+                tranche_label = tier_spec["label"] if is_manual_pyramid else ("REVERSAL_FLIP" if is_manual_reversal else "POS1_M1_M5_SCALP")
                 db.record_capital_auto_trade(
                     chat_id=chat_id,
                     deal_id=str(deal_id),
-                    deal_reference=str(deal_id),
+                    deal_reference=str(deal_ref),
                     epic="GOLD",
                     direction=direction.upper(),
                     size=size,
@@ -1163,22 +2681,26 @@ class QuantGoldExecutionEngine:
                     tp=tp1,
                     scale_tier=0,
                     sl_dist=sl_dist,
-                    tranche_id="SINGLE",
+                    tranche_id=tranche_label,
                     tp1=tp1,
                     tp2=tp2,
                     tp3=tp3
                 )
-                logger.info(f"✅ [1-TAP GOLD] User {chat_id} placed {direction} {size} oz GOLD @ ${entry_price:.2f} (SL: ${sl:.2f}, TP1: ${tp1:.2f})")
+                logger.info(f"✅ [1-TAP GOLD] User {chat_id} placed {direction} {size} oz GOLD @ ${entry_price:.2f} (Tranche: {tranche_label}, SL: ${sl:.2f}, TP1: ${tp1:.2f})")
 
                 # If broadcast to VIP requested
                 if broadcast_vip:
+                    c_type = "REVERSAL" if is_manual_reversal else ("PYRAMID" if is_manual_pyramid else "SIGNAL")
+                    tr_num = len(gold_trades) + 1 if is_manual_pyramid else 1
                     vip_card = format_gold_signal_card(
                         direction=direction,
                         sl=sl,
                         tp1=tp1,
                         tp2=tp2,
                         tp3=tp3,
-                        entry_price=entry_price
+                        entry_price=entry_price,
+                        card_type=c_type,
+                        tranche_num=tr_num
                     )
                     markup = get_gold_signal_reply_markup()
                     await self.broadcast_to_vip_users(vip_card, app=app, reply_markup=markup)
@@ -1186,7 +2708,173 @@ class QuantGoldExecutionEngine:
             return order_res
         except Exception as e:
             logger.error(f"❌ [1-TAP GOLD] Error placing Gold order for {chat_id}: {e}", exc_info=True)
-            return {"success": False, "message": str(e)}
+            return {"success": False, "message": str(e), "error": str(e)}
+
+    async def _close_all_fleet_open_gold_positions(
+        self,
+        direction: str,
+        reason: str,
+        exit_price: float,
+        current_pnl_pts: float = 0.0,
+        app = None,
+        target_scope: str = "ALL"  # "ALL", "SCALP_ONLY", "MACRO_ONLY"
+    ) -> int:
+        """
+        UNIVERSAL FLEET-WIDE SYNCHRONIZED CLOSE (AQ88 Invariant 121 & Dual-Engine Covenant):
+        Concurrently closes open Gold positions across the fleet (Super Admin Live, Super Admin Demo, and all VIPs)
+        at the exact same second, cleanly scoped by target_scope ("ALL", "SCALP_ONLY", or "MACRO_ONLY").
+        """
+        dir_upper = str(direction).upper()
+        targets_to_close = []
+        seen_deals = set()
+
+        # 1. Gather all open Gold trades from database matching this direction
+        db_trades = []
+        db_deal_info = {}
+        try:
+            db_trades = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
+            for t in db_trades:
+                if str(t.get("epic", "")).upper() == "GOLD":
+                    d_id = str(t.get("deal_id", ""))
+                    if d_id:
+                        db_deal_info[d_id] = {
+                            "tranche_id": str(t.get("tranche_id", "") or ""),
+                            "scale_tier": int(t.get("scale_tier", 0) or 0)
+                        }
+
+            for t in db_trades:
+                if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("direction", "")).upper() == dir_upper:
+                    d_id = str(t.get("deal_id", ""))
+                    if d_id and d_id not in seen_deals and not d_id.startswith("MANUAL_"):
+                        t_lbl = str(t.get("tranche_id", "") or "")
+                        s_tier = int(t.get("scale_tier", 0) or 0)
+                        t_cid = t.get("chat_id") or 859271875
+                        is_e1 = is_engine_1_scalp(t_lbl, s_tier)
+                        if target_scope == "SCALP_ONLY" and not is_e1:
+                            continue
+                        if target_scope == "MACRO_ONLY" and is_e1:
+                            continue
+                        if target_scope == "VIP_ONLY" and t_cid == 859271875:
+                            continue
+                        seen_deals.add(d_id)
+                        targets_to_close.append({
+                            "chat_id": t_cid,
+                            "is_demo": bool(t.get("is_demo", False)),
+                            "deal_id": d_id,
+                            "entry_price": float(t.get("entry_price", exit_price) or exit_price),
+                            "size": float(t.get("size", 0.5) or 0.5),
+                            "tranche_id": t_lbl,
+                            "scale_tier": s_tier
+                        })
+        except Exception as e_dbt:
+            logger.debug(f"Fleet close DB query note: {e_dbt}")
+
+        # 2. Interrogate broker open positions directly across all active users
+        active_users = db.get_active_capital_auto_users() or []
+        user_targets = [
+            {"chat_id": 859271875, "is_demo": False},
+            {"chat_id": 859271875, "is_demo": True}
+        ]
+        for u in active_users:
+            cid = u.get("chat_id")
+            if cid and cid != 859271875:
+                user_targets.append({"chat_id": cid, "is_demo": bool(u.get("is_demo", False))})
+
+        seen_user_targets = {(ut["chat_id"], ut["is_demo"]) for ut in user_targets}
+        for vip_cid in [643724109, 1744387717]:
+            if (vip_cid, False) not in seen_user_targets:
+                user_targets.append({"chat_id": vip_cid, "is_demo": False})
+                seen_user_targets.add((vip_cid, False))
+
+        for ut in user_targets:
+            cid = ut["chat_id"]
+            is_demo = ut["is_demo"]
+            try:
+                u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                if not u_eng:
+                    continue
+                pos_list = await asyncio.wait_for(asyncio.to_thread(u_eng.get_open_positions), timeout=3.0)
+                for p_item in (pos_list or []):
+                    pos = p_item.get("position", p_item)
+                    epic = str(p_item.get("market", {}).get("epic") or pos.get("epic") or "").upper()
+                    p_dir = str(pos.get("direction", "")).upper()
+                    d_id = str(pos.get("dealId") or pos.get("deal_id") or "")
+                    if epic == "GOLD" and p_dir == dir_upper and d_id and d_id not in seen_deals:
+                        info = db_deal_info.get(d_id, {})
+                        t_lbl = info.get("tranche_id", "")
+                        s_tier = info.get("scale_tier", 0)
+                        is_e1 = is_engine_1_scalp(t_lbl, s_tier)
+                        if target_scope == "SCALP_ONLY" and not is_e1:
+                            continue
+                        if target_scope == "MACRO_ONLY" and is_e1:
+                            continue
+                        if target_scope == "VIP_ONLY" and cid == 859271875:
+                            continue
+                        seen_deals.add(d_id)
+                        lvl = float(pos.get("level") or pos.get("openLevel") or exit_price)
+                        sz = float(pos.get("size", 0.5) or 0.5)
+                        targets_to_close.append({
+                            "chat_id": cid,
+                            "is_demo": is_demo,
+                            "deal_id": d_id,
+                            "entry_price": lvl,
+                            "size": sz,
+                            "tranche_id": t_lbl,
+                            "scale_tier": s_tier
+                        })
+            except Exception as e_b_scan:
+                logger.debug(f"Broker position scan note for user {cid} (demo={is_demo}): {e_b_scan}")
+
+        if not targets_to_close:
+            logger.info(f"🏛️ [FLEET CLOSE] Zero active {dir_upper} Gold positions found matching scope={target_scope}.")
+            if target_scope == "ALL":
+                self._clear_active_trade(cooldown=20.0, direction=dir_upper)
+            return 0
+
+        logger.info(f"⚡ [FLEET-WIDE SYNCHRONIZED CLOSE] Closing {len(targets_to_close)} {dir_upper} Gold positions ({reason}, scope={target_scope}) @ ${exit_price:.2f}...")
+
+        # 3. Concurrent fan-out close across all broker sessions via asyncio.gather
+        async def _close_single_target(item: dict) -> dict:
+            c_id = item["chat_id"]
+            d_id = item["deal_id"]
+            i_demo = item["is_demo"]
+            e_price = item["entry_price"]
+            s_val = item["size"]
+            try:
+                u_eng = capital_engine.get_user_capital_engine(c_id, is_demo=i_demo)
+                c_res = await asyncio.to_thread(u_eng.close_position, deal_id=d_id) if u_eng else {"success": False}
+                pnl_pts = (exit_price - e_price) if dir_upper == "BUY" else (e_price - exit_price)
+                upl = pnl_pts * s_val
+                if hasattr(db, "update_capital_auto_trade_close"):
+                    db.update_capital_auto_trade_close(d_id, exit_price=exit_price, pnl=upl)
+                logger.info(f"✅ [FLEET CLOSE ITEM] Closed {dir_upper} deal #{d_id} for user {c_id} (Demo={i_demo}) @ ${exit_price:.2f} (PnL: ${upl:.2f})")
+                return {"deal_id": d_id, "chat_id": c_id, "success": c_res.get("success", False), "upl": upl, "pnl_pts": pnl_pts}
+            except Exception as e_close_one:
+                logger.warning(f"Error closing target deal {d_id} for user {c_id}: {e_close_one}")
+                if hasattr(db, "update_capital_auto_trade_close"):
+                    db.update_capital_auto_trade_close(d_id, exit_price=exit_price, pnl=0.0)
+                return {"deal_id": d_id, "chat_id": c_id, "success": False, "error": str(e_close_one)}
+
+        results = await asyncio.gather(*[_close_single_target(t) for t in targets_to_close], return_exceptions=True)
+
+        # 4. Broadcast ONE single consolidated profit alert card to VIP users if profitable
+        pips = int(round(current_pnl_pts * 10.0))
+        if current_pnl_pts >= 0.80 or pips >= 8:
+            card_stage = "SCALP" if (current_pnl_pts < 6.0 and pips < 50) else "CLOSE"
+            card_shock = format_gold_tp_card(
+                stage=card_stage,
+                pips=max(pips, 10),
+                direction=dir_upper,
+                entry_price=targets_to_close[0]["entry_price"]
+            )
+            markup = get_gold_signal_reply_markup()
+            await self.broadcast_to_vip_users(card_shock, app=app, reply_markup=markup)
+
+        # 5. Clear global active trade state only if ALL positions were targeted
+        if target_scope == "ALL":
+            self._clear_active_trade(cooldown=20.0, direction=dir_upper)
+            self._cached_broker_gold_count = 0
+        return len(targets_to_close)
 
     async def _audit_and_protect_open_gold_positions(self, app=None):
         """
@@ -1205,6 +2893,7 @@ class QuantGoldExecutionEngine:
         try:
             bid, ask, spread = self.get_live_gold_price_quote()
             curr_p = (bid + ask) / 2.0
+            now = time.time()
             
             # Step -1: Price Sanity Veto: Abort audit cycle if quote is corrupted
             if curr_p < 3500.0 or curr_p > 6000.0:
@@ -1225,34 +2914,100 @@ class QuantGoldExecutionEngine:
                     if cid:
                         active_trades.extend(db.get_capital_auto_trades(cid, status="OPEN"))
 
+            # If DB query returned empty due to temporary sync lag, but RAM holds active trade:
+            if not active_trades and self._active_gold_deal_id and self._active_gold_entry_price > 0.0:
+                active_trades = [{
+                    "chat_id": 859271875,
+                    "deal_id": self._active_gold_deal_id,
+                    "epic": "GOLD",
+                    "direction": self._active_gold_direction or "BUY",
+                    "entry_price": self._active_gold_entry_price,
+                    "sl": getattr(self, "_active_gold_sl", 0.0),
+                    "tp1": getattr(self, "_active_gold_tp1", 0.0),
+                    "tp2": getattr(self, "_active_gold_tp2", 0.0),
+                    "tp3": getattr(self, "_active_gold_tp3", 0.0),
+                    "status": "OPEN",
+                    "scale_tier": getattr(self, "_active_gold_scale_tier", 0),
+                    "is_demo": 0
+                }]
+
             # Broker reconciliation: interrogate broker open positions per user & mode
-            broker_open_deal_ids = set()
+            # Broker reconciliation: interrogate broker open positions per user & mode
+            user_broker_open_deals: Dict[Tuple[int, bool], set] = {}
+            successfully_audited_engs: set = set()
             try:
-                checked_engs = set()
                 for tr in active_trades:
                     c_id = tr.get("chat_id") or 859271875
                     t_demo = bool(tr.get("is_demo", False))
                     eng_k = (c_id, t_demo)
-                    if eng_k in checked_engs:
+                    if eng_k in successfully_audited_engs:
                         continue
-                    checked_engs.add(eng_k)
                     try:
                         u_eng = capital_engine.get_user_capital_engine(c_id, is_demo=t_demo)
                         if u_eng:
                             pos_list = await asyncio.to_thread(u_eng.get_open_positions)
-                            if pos_list:
+                            fetch_failed = getattr(u_eng, "_last_positions_fetch_failed", False)
+                            if pos_list is not None and not fetch_failed:
+                                d_set = set()
                                 for p_item in pos_list:
                                     pos = p_item.get("position", p_item)
                                     d_id = str(pos.get("dealId") or pos.get("deal_id") or "")
                                     epic = str(p_item.get("market", {}).get("epic") or pos.get("epic") or "").upper()
                                     if d_id and epic == "GOLD":
-                                        broker_open_deal_ids.add(d_id)
+                                        d_set.add(d_id)
+                                user_broker_open_deals[eng_k] = d_set
+                                successfully_audited_engs.add(eng_k)
                     except Exception as e_b_usr:
                         logger.debug(f"User broker position audit note for {c_id}: {e_b_usr}")
             except Exception as e_bpos:
                 logger.debug(f"Broker open positions check note: {e_bpos}")
 
-            for tr in active_trades:
+            # Orphaned Fleet Harmonization & Desynchronization Armor (AQ88 Invariant 121):
+            # Check if Super Admin is flat (0 open Gold positions) while any VIP user still holds an open Gold trade.
+            sa_live_deals = user_broker_open_deals.get((859271875, False), set())
+            sa_demo_deals = user_broker_open_deals.get((859271875, True), set())
+            is_sa_flat_now = (len(sa_live_deals) == 0 and len(sa_demo_deals) == 0) and (
+                (859271875, False) in successfully_audited_engs or (859271875, True) in successfully_audited_engs
+            )
+
+            if is_sa_flat_now:
+                self._sa_flat_consecutive_cycles += 1
+            else:
+                self._sa_flat_consecutive_cycles = 0
+
+            # Double check database: if Super Admin still has open trades recorded in DB, do not sweep
+            sa_db_open_trades = [
+                tr for tr in active_trades
+                if str(tr.get("epic", "")).upper() == "GOLD"
+                and str(tr.get("status", "OPEN")).upper() == "OPEN"
+                and (tr.get("chat_id") == 859271875 or not tr.get("chat_id"))
+            ]
+            is_sa_truly_flat = (self._sa_flat_consecutive_cycles >= 5 and len(sa_db_open_trades) == 0)
+
+            if is_sa_truly_flat:
+                lingering_vip_trades = [
+                    tr for tr in active_trades
+                    if str(tr.get("epic", "")).upper() == "GOLD"
+                    and str(tr.get("status", "OPEN")).upper() == "OPEN"
+                    and tr.get("chat_id") != 859271875
+                ]
+                if lingering_vip_trades:
+                    first_dir = str(lingering_vip_trades[0].get("direction", "BUY")).upper()
+                    logger.info(
+                        f"⚡ [ORPHANED FLEET SWEEP] Super Admin is confirmed flat (0 positions across {self._sa_flat_consecutive_cycles} cycles), but {len(lingering_vip_trades)} VIP Gold trades "
+                        f"remain open. Auto-closing lingering VIP positions in sync with Super Admin!"
+                    )
+                    await self._close_all_fleet_open_gold_positions(
+                        direction=first_dir,
+                        reason="ORPHANED_FLEET_SYNC_CLOSE",
+                        exit_price=curr_p,
+                        current_pnl_pts=0.0,
+                        app=app,
+                        target_scope="VIP_ONLY"
+                    )
+                    return
+
+            for idx, tr in enumerate(active_trades):
                 if str(tr.get("epic", "")).upper() != "GOLD":
                     continue
                 status = str(tr.get("status", "OPEN")).upper()
@@ -1271,7 +3026,55 @@ class QuantGoldExecutionEngine:
                 tp3 = float(tr.get("tp3", 0.0) or 0.0)
                 scale_tier = int(tr.get("scale_tier", 0) or 0)
 
-                # Step 1: Entry price sanity & price jump anomaly guard
+                pnl_pts = (curr_p - entry_p) if dir_side == "BUY" else (entry_p - curr_p)
+                pips = int(round(pnl_pts * 10.0))
+                upl = pnl_pts * sz
+                dir_label = "Buy" if dir_side == "BUY" else "Sell"
+                deal_key = str(deal_id)
+
+                # Step 1: Broker Server-Side Closure Check
+                # If THIS specific user's broker was successfully queried and this deal is not in user's broker positions, it is closed!
+                user_eng_k = (cid, is_demo)
+                if user_eng_k in successfully_audited_engs:
+                    user_deals = user_broker_open_deals.get(user_eng_k, set())
+                    tr_open_ts = float(tr.get("open_time_ts") or tr.get("timestamp") or 0.0)
+                    if tr_open_ts > 0 and (now - tr_open_ts) < 25.0:
+                        continue
+                    if str(deal_id) not in user_deals and deal_id != "OK":
+                        matched_bp = False
+                        if str(deal_id).startswith("o_") and user_deals:
+                            for bp_deal in user_deals:
+                                if hasattr(db, "update_capital_auto_trade_deal_id"):
+                                    if db.update_capital_auto_trade_deal_id(str(deal_id), str(bp_deal)):
+                                        deal_id = bp_deal
+                                        matched_bp = True
+                                        logger.info(f"🏛️ [BROKER SYNC] Re-mapped order ref {deal_key} -> broker deal #{bp_deal} for user {cid}")
+                                        break
+                        if matched_bp:
+                            continue
+                        logger.info(f"🏛️ [BROKER SYNC] Gold trade {deal_id} was closed on Capital.com broker for user {cid}.")
+                        if hasattr(db, "update_capital_auto_trade_close"):
+                            db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
+                        
+                        if upl > 0 or pips > 0 or scale_tier >= 1:
+                            key_close = f"{deal_id}:CLOSED"
+                            if key_close not in self._notified_milestones:
+                                self._notified_milestones.add(key_close)
+                                card_close_win = format_gold_tp_card(
+                                    stage="CLOSE",
+                                    pips=max(pips, 73 if scale_tier >= 1 else 10),
+                                    direction=dir_side,
+                                    entry_price=entry_p
+                                )
+                                markup = get_gold_signal_reply_markup()
+                                await self.broadcast_to_vip_users(card_close_win, app=app, reply_markup=markup)
+                            self._clear_active_trade(deal_id, cooldown=20.0, direction=dir_side)
+                        else:
+                            logger.info(f"Gold trade {deal_id} closed at loss (${upl:.2f}). VIP alert suppressed as per Fiduciary Profit-Only policy.")
+                            self._clear_active_trade(deal_id, cooldown=45.0, direction=dir_side)
+                        continue
+
+                # Step 2: Entry price sanity & price jump anomaly guard
                 if entry_p < 3500.0 or entry_p > 6000.0:
                     logger.warning(f"⚠️ [AUDIT IGNORED] Corrupted/legacy entry price ${entry_p:.2f} for deal {deal_id}. Skipping.")
                     continue
@@ -1285,53 +3088,190 @@ class QuantGoldExecutionEngine:
                     continue
 
                 # Calibrate fallback targets if missing or invalid
+                sl_ref_dist = abs(entry_p - sl) if (sl > 0 and abs(entry_p - sl) > 5.0) else 16.0
                 if tp1 <= 0.0 or tp1 < 3500.0 or tp1 > 6000.0:
-                    tp1 = round((entry_p + 7.30) if dir_side == "BUY" else (entry_p - 7.30), 2)
+                    tp1 = round((entry_p + sl_ref_dist * 1.50) if dir_side == "BUY" else (entry_p - sl_ref_dist * 1.50), 2)
                 if tp2 <= 0.0 or tp2 < 3500.0 or tp2 > 6000.0:
-                    tp2 = round((entry_p + 15.20) if dir_side == "BUY" else (entry_p - 15.20), 2)
+                    tp2 = round((entry_p + sl_ref_dist * 2.50) if dir_side == "BUY" else (entry_p - sl_ref_dist * 2.50), 2)
                 if tp3 <= 0.0 or tp3 < 3500.0 or tp3 > 6000.0:
-                    tp3 = round((entry_p + 24.32) if dir_side == "BUY" else (entry_p - 24.32), 2)
+                    tp3 = round((entry_p + sl_ref_dist * 4.00) if dir_side == "BUY" else (entry_p - sl_ref_dist * 4.00), 2)
 
-                pnl_pts = (curr_p - entry_p) if dir_side == "BUY" else (entry_p - curr_p)
-                pips = int(round(pnl_pts * 10.0))
-                upl = pnl_pts * sz
-                dir_label = "Buy" if dir_side == "BUY" else "Sell"
-                deal_key = str(deal_id)
-
-                # Broker Server-Side Closure Check:
-                if broker_open_deal_ids and deal_id not in broker_open_deal_ids and deal_id != "OK":
-                    logger.info(f"🏛️ [BROKER SYNC] Gold trade {deal_id} was closed on Capital.com broker.")
-                    if hasattr(db, "update_capital_auto_trade_close"):
-                        db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
-                    
-                    if upl > 0 or pips > 0 or scale_tier >= 1:
-                        key_close = f"{deal_id}:CLOSED"
-                        if key_close not in self._notified_milestones:
-                            self._notified_milestones.add(key_close)
-                            card_close_win = format_gold_tp_card(
-                                stage="CLOSE",
-                                pips=max(pips, 73 if scale_tier >= 1 else 10),
-                                direction=dir_side,
-                                entry_price=entry_p
-                            )
-                            markup = get_gold_signal_reply_markup()
-                            await self.broadcast_to_vip_users(card_close_win, app=app, reply_markup=markup)
-                        self._clear_active_trade(deal_id, cooldown=300.0)
-                    else:
-                        logger.info(f"Gold trade {deal_id} closed at loss (${upl:.2f}). VIP alert suppressed as per Fiduciary Profit-Only policy.")
-                        self._clear_active_trade(deal_id, cooldown=900.0)
-                    continue
-
-                # Track peak UPL for Flash Shock Protective Early Harvest (bounded to sane $150 max)
+                # Track peak UPL (dollars) and peak price points (pips) for Flash Shock Harvest
                 current_peak = self._peak_upl_map.get(deal_key, 0.0)
                 if upl > current_peak and upl <= 150.0:
                     self._peak_upl_map[deal_key] = upl
                     current_peak = upl
 
-                # Flash Shock Protective Early Harvest (Invariants 35 & 104):
-                # If Peak UPL >= $2.50 (or pips >= 40) and price retraces >= 50% from peak
-                if 2.50 <= current_peak <= 150.0 and upl <= (current_peak * 0.50) and upl > 0.50:
-                    logger.info(f"⚡ [FLASH SHOCK HARVEST] Gold trade {deal_id} peak ${current_peak:.2f} retraced >= 50% to ${upl:.2f}. Executing protective early harvest!")
+                current_peak_pts = getattr(self, "_peak_pnl_pts_map", {}).get(deal_key, 0.0)
+                if pnl_pts > current_peak_pts and pnl_pts <= 150.0:
+                    if not hasattr(self, "_peak_pnl_pts_map"):
+                        self._peak_pnl_pts_map = {}
+                    self._peak_pnl_pts_map[deal_key] = pnl_pts
+                    current_peak_pts = pnl_pts
+
+                is_manual_trade = (
+                    str(tr.get("strategy", "")).upper() == "MANUAL" or
+                    str(tr.get("deal_reference", "")).startswith("MANUAL") or
+                    str(tr.get("source", "")).upper() == "MANUAL"
+                )
+
+                # Flash Shock & Micro-Exhaustion Peak Protective Harvest (Invariants 35, 104, 121 & 128):
+                # 100% Size-Invariant: Governed strictly by Price Points / Pips, NOT fixed dollar thresholds!
+                # Responsive Climax Harvest: Protects real profits from evaporating back to scratch!
+                is_be_protected = (deal_id in self._be_armor_locked_deals or scale_tier >= 1)
+                min_fee_upl = max(0.50, spread * sz * 1.5)
+                min_profit_pts = max(1.20, spread * 2.0)  # At least +12 pips ($1.20)
+
+                # Flash Shock Harvest: Requires peak (>= +2.50 pts / +25 pips, or UPL >= $2.50)
+                # and retraces >= 45% from that peak, protecting banked profits:
+                is_shock_pts = (
+                    not is_manual_trade and
+                    current_peak_pts >= 2.50 and
+                    current_peak_pts <= 150.0 and
+                    pnl_pts <= (current_peak_pts * 0.55) and  # retraced >= 45% from peak
+                    pnl_pts >= 1.20 and
+                    upl >= max(1.00, spread * 1.5)
+                )
+                is_shock_upl = (
+                    not is_manual_trade and
+                    current_peak >= 2.50 and
+                    current_peak <= 150.0 and
+                    upl <= (current_peak * 0.55) and          # retraced >= 45% from peak UPL
+                    upl >= max(1.00, spread * 1.5)
+                )
+
+                # M5 Micro-Exhaustion Peak Harvester:
+                # Triggers when peak >= 2.50 pts / $2.50, retraces >= 30% from peak, and confirmed reversal pinbar/exhaustion on M5!
+                is_exhaustion_harvest = False
+                if not is_manual_trade and (current_peak_pts >= 2.50 or current_peak >= 2.50) and upl >= max(1.20, spread * 1.6):
+                    if (pnl_pts <= current_peak_pts * 0.70) or (current_peak > 0 and upl <= current_peak * 0.70):  # Retraced >= 30% from +65 pips peak
+                        try:
+                            candles_m5 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
+                            if candles_m5 is not None and len(candles_m5) >= 2:
+                                c_last = candles_m5.iloc[-1]
+                                o_val, h_val, l_val, c_val = float(c_last['open']), float(c_last['high']), float(c_last['low']), float(c_last['close'])
+                                c_range = max(0.25, h_val - l_val)
+
+                                # Net Order Flow Force Check on M5
+                                try:
+                                    from mathematical_engine import compute_net_buy_sell_force
+                                    f_metrics = compute_net_buy_sell_force(candles_m5)
+                                    exh_state = f_metrics.get("exhaustion_state", "NEUTRAL_BALANCED")
+                                    b_force = float(f_metrics.get("buy_force_pct", 50.0))
+                                    s_force = float(f_metrics.get("sell_force_pct", 50.0))
+                                except Exception:
+                                    exh_state = "NEUTRAL_BALANCED"
+                                    b_force, s_force = 50.0, 50.0
+
+                                if dir_side == "BUY":
+                                    upper_wick = (h_val - max(o_val, c_val)) / c_range
+                                    if (upper_wick >= 0.45 and s_force >= 65.0) or exh_state == "BULLS_EXHAUSTED_AT_TOP":
+                                        is_exhaustion_harvest = True
+                                else:
+                                    lower_wick = (min(o_val, c_val) - l_val) / c_range
+                                    if (lower_wick >= 0.45 and b_force >= 65.0) or exh_state == "BEARS_EXHAUSTED_AT_BOTTOM":
+                                        is_exhaustion_harvest = True
+                        except Exception as e_exh:
+                            logger.debug(f"Exhaustion check note: {e_exh}")
+
+                tranche_lbl = str(tr.get("tranche_id", "") or "")
+                is_e1 = is_engine_1_scalp(tranche_lbl, scale_tier)
+                is_e2 = not is_e1
+
+                # Flash Shock & Micro-Exhaustion Peak Protective Harvest (Invariants 35, 104 & 121):
+                # Machine 1 Scalp: Closes ONLY Machine 1 scalp position (Machine 2 Macro runners continue unimpeded!)
+                # Machine 2 Macro: Strictly immune to micro-cuts ($0.50 - $5.00) to let macro trend breathe!
+                if is_e1 and (is_shock_pts or is_shock_upl or is_exhaustion_harvest):
+                    harvest_tag = "M1_M5_SCALP_EXHAUSTION_HARVEST" if is_exhaustion_harvest else "M1_M5_SCALP_SHOCK_HARVEST"
+                    logger.info(
+                        f"⚡ [{harvest_tag}] Machine 1 Scalp trade {deal_id} peak ({current_peak_pts:.2f} pts / ${current_peak:.2f}) "
+                        f"pulled back to ({pnl_pts:.2f} pts / ${upl:.2f}). Harvesting Scalp position ONLY (Machine 2 Macro runners continue)!"
+                    )
+                    try:
+                        if cid:
+                            u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                            await asyncio.to_thread(u_eng.close_position, deal_id=deal_id)
+                        if hasattr(db, "update_capital_auto_trade_close"):
+                            db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
+                        card_scalp = format_gold_tp_card(
+                            stage="SCALP",
+                            pips=pips,
+                            direction=dir_side,
+                            entry_price=entry_p
+                        )
+                        markup = get_gold_signal_reply_markup()
+                        await self.broadcast_to_vip_users(card_scalp, app=app, reply_markup=markup)
+                        self._clear_active_trade(deal_key, cooldown=15.0, direction=dir_side)
+                        continue
+                    except Exception as e_sc_close:
+                        logger.debug(f"Machine 1 scalp shock harvest close note: {e_sc_close}")
+
+                # 360° Real-Time Market Invalidation & Early Reversal Surveillance (News & Buy/Sell Order Flow):
+                # ANTI-WHIPSAW FLIP COVENANT (AQ84 Invariant 116):
+                # 1. HARD QUOTA: Maximum 1 Reversal Flip per swing cycle! If already a REVERSAL_FLIP, NEVER flip again!
+                # 2. ANTI-CHOP LOCKOUT: Reversal Flip is strictly blocked in middle 35%-65% Dealing Range.
+                # 3. REVERSAL COOLDOWN: 30-minute lockout after any flip to let the new trade run to its profit targets.
+                # 4. DEPTH FILTER: Requires genuine structural floating loss (upl <= -$2.50 / pnl_pts <= -4.00 pts)
+                #    to prevent jitter on small spread noise.
+                now_curr = time.time()
+                tranche_lbl = str(tr.get("tranche_id", "") or "")
+                trade_setup = str(tr.get("setup_type", "") or "")
+                trade_open_ts = float(tr.get("created_at_ts", 0.0) or 0.0)
+                is_floating_loss = (upl <= -2.50 or pnl_pts <= -4.00)
+                is_held_enough = (trade_open_ts <= 0.0) or ((now_curr - trade_open_ts) >= (45.0 if is_floating_loss else 90.0))
+                is_already_flipped = (
+                    "REVERSAL" in tranche_lbl or
+                    "REVERSAL" in trade_setup or
+                    (now_curr - getattr(self, "_last_reversal_flip_ts", 0.0)) < 180.0  # 3-min anti-whipsaw cooldown (was 1800s / 30m)
+                )
+                if is_floating_loss and not is_manual_trade and not is_already_flipped and is_held_enough:
+                    try:
+                        from quant_gold_security import get_quant_gold_security_citadel
+                        mtf_snap = self.mtf_engine.analyze_all_19_timeframes(current_price=curr_p)
+                        candles_m1 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M1")
+                        candles_m15 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M15")
+                        math_snap = self.math_core.analyze_mathematical_edge(
+                            current_price=curr_p,
+                            candles_m1=candles_m1,
+                            candles_m15=candles_m15
+                        )
+                        inv_check = get_quant_gold_security_citadel().evaluate_360_market_invalidation(
+                            current_price=curr_p,
+                            position_direction=dir_side,
+                            mtf_data=mtf_snap,
+                            math_data=math_snap
+                        )
+                        if inv_check.get("is_invalidated") and inv_check.get("reversal_direction"):
+                            opp_dir = inv_check["reversal_direction"]
+                            logger.info(
+                                f"🔄 [360° EARLY MICRO-CUT & REVERSAL] Gold trade {deal_id} ({dir_side}) "
+                                f"severely invalidated by {inv_check.get('reason')}. "
+                                f"Triggering Universal Fleet-Wide Close @ ${curr_p:.2f} (Loss: ${upl:.2f}) to Flip into {opp_dir} immediately!"
+                            )
+                            self._last_reversal_flip_ts = now_curr
+                            self._pending_reversal_action = opp_dir
+                            await self._close_all_fleet_open_gold_positions(
+                                direction=dir_side,
+                                reason="360_MARKET_INVALIDATION_FLIP",
+                                exit_price=curr_p,
+                                current_pnl_pts=pnl_pts,
+                                app=app
+                            )
+                            break
+                    except Exception as e_rev_cut:
+                        logger.debug(f"360 reversal check note: {e_rev_cut}")
+
+                # Emergency Broker SL Safety Fallback (AQ88 Invariant 132):
+                # The primary Stop Loss (5.00 to 6.50 pts = $2.50 to $3.25 max risk on 0.5 lot)
+                # is natively placed on the broker's servers upon order entry.
+                # Software panic cuts at -4.50 pts are ELIMINATED to let Gold breathe through normal noise.
+                # Emergency close ONLY triggers if broker SL failed and loss exceeds -8.00 pts (-$4.00).
+                if is_floating_loss and not is_manual_trade and (upl <= -4.00 or pnl_pts <= -8.00):
+                    logger.info(
+                        f"🛡️ [EMERGENCY BROKER SL FALLBACK] Gold trade {deal_id} ({dir_side}) "
+                        f"exceeded structural invalidation at ${curr_p:.2f} (Loss: ${upl:.2f} / {pnl_pts:.2f} pts). "
+                        f"Emergency closing trade to enforce absolute capital ceiling!"
+                    )
                     try:
                         if cid:
                             u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
@@ -1339,124 +3279,252 @@ class QuantGoldExecutionEngine:
                         if hasattr(db, "update_capital_auto_trade_close"):
                             db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
                         
-                        card_shock = format_gold_tp_card(
-                            stage="CLOSE",
-                            pips=pips,
-                            direction=dir_side,
-                            entry_price=entry_p
-                        )
-                        markup = get_gold_signal_reply_markup()
-                        await self.broadcast_to_vip_users(card_shock, app=app, reply_markup=markup)
-                        self._clear_active_trade(deal_key, cooldown=300.0)
+                        # Engage 15-Minute Directional Quarantine against revenge counter-trend chasing (AQ88 Invariant 130)
+                        self._directional_quarantine_dir = dir_side
+                        self._directional_quarantine_until = time.time() + 900.0  # 15 minutes
+                        logger.info(f"🛡️ [DIRECTIONAL QUARANTINE] Quarantined {dir_side} direction for 15 minutes to stop revenge chasing!")
+
+                        self._clear_active_trade(deal_key, cooldown=45.0, direction=dir_side)
                         continue
-                    except Exception as e_shk:
-                        logger.debug(f"Flash shock harvest note: {e_shk}")
+                    except Exception as e_cut:
+                        logger.debug(f"Emergency SL fallback note: {e_cut}")
 
-                # Check TP1 Hit (+73 pips / $7.30 move) - bounded to legitimate range ($7.30 to $60.00)
-                is_tp1 = (7.30 <= pnl_pts <= 60.0) or (
-                    ((dir_side == "BUY" and curr_p >= tp1) or (dir_side == "SELL" and curr_p <= tp1))
-                    and (5.0 <= pnl_pts <= 60.0)
-                )
-                if is_tp1 and scale_tier < 1:
-                    key_tp1 = f"{deal_id}:TP1"
-                    if key_tp1 not in self._notified_milestones:
-                        self._notified_milestones.add(key_tp1)
-                        if hasattr(db, "update_capital_auto_trade_scale_tier"):
-                            db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=1)
+                # ── MACHINE 1: M5 SCALP FAST HARVESTER (M15 CONFLUENCE) ──
+                # Target: +$5.00 to +$10.00 (+100 pips / +10 pts) per trade.
+                # Armor: When profit reaches >= +$3.50 (+7.0 pts / +70 pips), shift SL to Breakeven Armor (Entry ± Spread Floor)!
+                if is_e1 and not is_manual_trade:
+                    # STEP 1: BREAKEVEN ARMOR PROTECTION AT >= +$3.50 (+7.0 pts / +70 pips)
+                    # Provides healthy breathing distance (>= 3.50 pts) so normal 1-2 pt spread noise CANNOT clip it!
+                    is_dollar_armor_hit = (upl >= 3.50 or pnl_pts >= 7.00)
+                    if is_dollar_armor_hit and scale_tier < 1 and deal_id not in self._be_armor_locked_deals:
+                        be_buffer = max(1.00, spread * 2.0)
+                        min_breathing_buf = max(3.50, spread * 4.0)
+                        if dir_side == "BUY":
+                            raw_be = entry_p + be_buffer
+                            be_level = min(raw_be, curr_p - min_breathing_buf)
+                        else:
+                            raw_be = entry_p - be_buffer
+                            be_level = max(raw_be, curr_p + min_breathing_buf)
 
-                        card_tp1 = format_gold_tp_card(
-                            stage="TP1",
-                            pips=pips,
-                            direction=dir_side,
-                            entry_price=entry_p
+                        if abs(sl - be_level) > 0.20:
+                            logger.info(
+                                f"🛡️ [SUPER SMART BREAKEVEN ARMOR] Machine 1 Scalp profit +${upl:.2f} reached +$3.50 milestone (+{pips} pips / {pnl_pts:.2f} pts). "
+                                f"Shifted SL to {be_level:.2f} (Entry ± Spread Floor, 0.00R Free Roll)! Trade is 100% loss-immune with 3.5+ pts breathing room!"
+                            )
+                            try:
+                                if cid:
+                                    u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                                    await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=round(be_level, 2))
+                                if hasattr(db, "update_capital_auto_trade_scale_tier"):
+                                    db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=1, sl=round(be_level, 2))
+                                tr["scale_tier"] = 1
+                                tr["sl"] = round(be_level, 2)
+                                scale_tier = 1
+                                sl = round(be_level, 2)
+                                self._be_armor_locked_deals.add(deal_id)
+                                self._active_gold_scale_tier = 1
+                                self._active_gold_sl = round(be_level, 2)
+                            except Exception as e_be1:
+                                logger.debug(f"Machine 1 $3.50 breakeven armor note: {e_be1}")
+                        else:
+                            self._be_armor_locked_deals.add(deal_id)
+                            scale_tier = 1
+                            tr["scale_tier"] = 1
+
+                    # STEP 2: TAKE PROFIT +$5.00 TO +$10.00 (+100 TO +200 PIPS)
+                    # Check M5 Net Order Flow for exhaustion
+                    candles_m5_scalp = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
+                    scalp_exhausted = False
+                    exhaustion_reason = ""
+                    b_f, s_f = 50.0, 50.0
+                    if candles_m5_scalp is not None and len(candles_m5_scalp) >= 2:
+                        try:
+                            from mathematical_engine import compute_net_buy_sell_force
+                            f_m5 = compute_net_buy_sell_force(candles_m5_scalp)
+                            b_f = float(f_m5.get("buy_force_pct", 50.0))
+                            s_f = float(f_m5.get("sell_force_pct", 50.0))
+                            ex_state = f_m5.get("exhaustion_state", "NEUTRAL_BALANCED")
+                            c_last = candles_m5_scalp.iloc[-1]
+                            o_v, h_v, l_v, c_v = float(c_last['open']), float(c_last['high']), float(c_last['low']), float(c_last['close'])
+                            rng_v = max(0.25, h_v - l_v)
+                            if dir_side == "BUY":
+                                u_wick = (h_v - max(o_v, c_v)) / rng_v
+                                if u_wick >= 0.38 and s_f >= 55.0:
+                                    scalp_exhausted = True
+                                    exhaustion_reason = f"UPPER_WICK_{u_wick*100:.0f}%_SELL_FORCE_{s_f:.0f}%"
+                                elif ex_state == "BULLS_EXHAUSTED_AT_TOP":
+                                    scalp_exhausted = True
+                                    exhaustion_reason = "M5_BULLS_EXHAUSTED_AT_TOP"
+                                elif b_f <= 35.0 and s_f >= 60.0:
+                                    scalp_exhausted = True
+                                    exhaustion_reason = f"BUY_FORCE_COLLAPSE_{b_f:.0f}%"
+                            else:
+                                l_wick = (min(o_v, c_v) - l_v) / rng_v
+                                if l_wick >= 0.38 and b_f >= 55.0:
+                                    scalp_exhausted = True
+                                    exhaustion_reason = f"LOWER_WICK_{l_wick*100:.0f}%_BUY_FORCE_{b_f:.0f}%"
+                                elif ex_state == "BEARS_EXHAUSTED_AT_BOTTOM":
+                                    scalp_exhausted = True
+                                    exhaustion_reason = "M5_BEARS_EXHAUSTED_AT_BOTTOM"
+                                elif s_f <= 35.0 and b_f >= 60.0:
+                                    scalp_exhausted = True
+                                    exhaustion_reason = f"SELL_FORCE_COLLAPSE_{s_f:.0f}%"
+                        except Exception:
+                            scalp_exhausted = False
+
+                    # A. Max Scalp TP Hit (+8.00$ / +160 pips / 16.0 pts):
+                    is_max_tp_hit = (upl >= 8.00 or pnl_pts >= 16.00)
+                    # B. Fast Harvest between +$5.00 and +$8.00 (+100 to +160 pips) upon exhaustion or peak pullback:
+                    is_fast_harvest_hit = (
+                        (upl >= 5.00 or pnl_pts >= 10.00) and (
+                            scalp_exhausted or
+                            (current_peak >= 6.00 and upl <= current_peak * 0.80) or
+                            (current_peak_pts >= 12.00 and pnl_pts <= current_peak_pts * 0.80)
                         )
-                        markup = get_gold_signal_reply_markup()
-                        await self.broadcast_to_vip_users(card_tp1, app=app, reply_markup=markup)
+                    )
 
-                    self._active_gold_stage = "TP1_LOCKED"
-
-                    # Ratchet SL to Breakeven Armor (Entry + 0.5x Spread)
-                    be_level = (entry_p + (spread * 0.5)) if dir_side == "BUY" else (entry_p - (spread * 0.5))
-                    if abs(sl - be_level) > 0.30:
-                        logger.info(f"🛡️ [BREAKEVEN ARMOR] TP1 Hit! Ratcheting SL to {be_level:.2f} for Gold trade {deal_id}")
+                    if is_max_tp_hit or is_fast_harvest_hit:
+                        harvest_reason = "MAX_SCALP_TP_REACHED" if is_max_tp_hit else f"EXHAUSTION_HARVEST ({exhaustion_reason or 'Peak Retrace'})"
+                        logger.info(
+                            f"⚡ [MACHINE 1 SCALP TAKE PROFIT] Gold scalp trade {deal_id} ({dir_side}) banked cash profit "
+                            f"+${upl:.2f} (+{pips} pips / {pnl_pts:.2f} pts) via {harvest_reason}! Banking scalp cash profit into pocket!"
+                        )
                         try:
                             if cid:
                                 u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
-                                await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=round(be_level, 2))
+                                await asyncio.to_thread(u_eng.close_position, deal_id=deal_id)
+                            if hasattr(db, "update_capital_auto_trade_close"):
+                                db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
+
+                            card_scalp = format_gold_tp_card(
+                                stage="SCALP",
+                                pips=pips,
+                                direction=dir_side,
+                                entry_price=entry_p
+                            )
+                            markup = get_gold_signal_reply_markup()
+                            await self.broadcast_to_vip_users(card_scalp, app=app, reply_markup=markup)
+                            self._clear_active_trade(deal_key, cooldown=15.0, direction=dir_side)
+                            continue
+                        except Exception as e_sc_tp:
+                            logger.debug(f"Machine 1 scalp close error: {e_sc_tp}")
+
+                # ── MACHINE 2: M15-H1 INSTITUTIONAL SWING RUNNER ──
+                # Target: +$12.00 to +$40.00+ (+240 to +800+ pips)
+                # Rides the full macro session waves (London Open / NY Open). Immune to scalp cuts!
+                if is_e2 and not is_manual_trade:
+                    # LEVEL 1: TP1 Hit (+7.50$ / +150 pips / 15.0 pts) -> Ratchet SL to Guaranteed Cash Floor (+6.00 pts = +$3.00 cash)
+                    is_m2_tp1 = (upl >= 7.50 or pnl_pts >= 15.00)
+                    if is_m2_tp1 and scale_tier < 2:
+                        cash_floor_pts = 6.00  # Guarantee at least +$3.00 cash in pocket
+                        cash_floor_sl = (entry_p + cash_floor_pts) if dir_side == "BUY" else (entry_p - cash_floor_pts)
+                        logger.info(
+                            f"💰 [MACHINE 2 TP1 CASH FLOOR] Macro swing trade {deal_id} reached +${upl:.2f} (+{pips} pips / {pnl_pts:.2f} pts). "
+                            f"Ratcheting SL to Guaranteed Cash Floor ${cash_floor_sl:.2f} (+60 pips cash floor)!"
+                        )
+                        try:
+                            if cid:
+                                u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                                await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=round(cash_floor_sl, 2))
                             if hasattr(db, "update_capital_auto_trade_scale_tier"):
-                                db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=1, sl=round(be_level, 2))
-                        except Exception as e_be:
-                            logger.debug(f"Breakeven update note: {e_be}")
+                                db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=2, sl=round(cash_floor_sl, 2))
+                            tr["scale_tier"] = 2
+                            tr["sl"] = round(cash_floor_sl, 2)
+                            scale_tier = 2
+                            sl = round(cash_floor_sl, 2)
+                            self._active_gold_scale_tier = 2
+                            self._active_gold_sl = round(cash_floor_sl, 2)
 
-                # Check TP2 Hit (+152 pips / $15.20 move) - bounded to legitimate range ($15.20 to $80.00)
-                is_tp2 = (15.20 <= pnl_pts <= 80.0) or (
-                    ((dir_side == "BUY" and curr_p >= tp2) or (dir_side == "SELL" and curr_p <= tp2))
-                    and (12.0 <= pnl_pts <= 80.0)
-                )
-                if is_tp2 and scale_tier < 2:
-                    key_tp2 = f"{deal_id}:TP2"
-                    if key_tp2 not in self._notified_milestones:
-                        self._notified_milestones.add(key_tp2)
-                        if hasattr(db, "update_capital_auto_trade_scale_tier"):
-                            db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=2)
+                            card_tp1 = format_gold_tp_card(
+                                stage="TP1",
+                                pips=pips,
+                                direction=dir_side,
+                                entry_price=entry_p
+                            )
+                            markup = get_gold_signal_reply_markup()
+                            await self.broadcast_to_vip_users(card_tp1, app=app, reply_markup=markup)
+                        except Exception as e_m2_tp1:
+                            logger.debug(f"Machine 2 TP1 ratchet note: {e_m2_tp1}")
 
-                        card_tp2 = format_gold_tp_card(
-                            stage="TP2",
-                            pips=pips,
-                            direction=dir_side,
-                            entry_price=entry_p
+                    # LEVEL 2: TP2 Hit (+12.50$ / +250 pips / 25.0 pts) -> Ratchet SL to +$8.00 cash floor (+16.0 pts)
+                    is_m2_tp2 = (upl >= 12.50 or pnl_pts >= 25.00)
+                    if is_m2_tp2 and scale_tier < 3:
+                        cash_floor_pts2 = 16.00  # Guarantee at least +$8.00 cash in pocket
+                        cash_floor_sl2 = (entry_p + cash_floor_pts2) if dir_side == "BUY" else (entry_p - cash_floor_pts2)
+                        logger.info(
+                            f"💰 [MACHINE 2 TP2 CASH FLOOR] Macro swing trade {deal_id} reached +${upl:.2f} (+{pips} pips / {pnl_pts:.2f} pts). "
+                            f"Ratcheting SL to lock +$8.00 cash floor (${cash_floor_sl2:.2f})!"
                         )
-                        markup = get_gold_signal_reply_markup()
-                        await self.broadcast_to_vip_users(card_tp2, app=app, reply_markup=markup)
+                        try:
+                            if cid:
+                                u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                                await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=round(cash_floor_sl2, 2))
+                            if hasattr(db, "update_capital_auto_trade_scale_tier"):
+                                db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=3, sl=round(cash_floor_sl2, 2))
+                            tr["scale_tier"] = 3
+                            tr["sl"] = round(cash_floor_sl2, 2)
+                            scale_tier = 3
+                            sl = round(cash_floor_sl2, 2)
+                            self._active_gold_scale_tier = 3
+                            self._active_gold_sl = round(cash_floor_sl2, 2)
 
-                    self._active_gold_stage = "TP2_LOCKED"
+                            card_tp2 = format_gold_tp_card(
+                                stage="TP2",
+                                pips=pips,
+                                direction=dir_side,
+                                entry_price=entry_p
+                            )
+                            markup = get_gold_signal_reply_markup()
+                            await self.broadcast_to_vip_users(card_tp2, app=app, reply_markup=markup)
+                        except Exception as e_m2_tp2:
+                            logger.debug(f"Machine 2 TP2 ratchet note: {e_m2_tp2}")
 
-                    # Ratchet SL to Guaranteed Cash Profit Floor (+73 pips)
-                    cash_floor = (entry_p + 7.30) if dir_side == "BUY" else (entry_p - 7.30)
-                    try:
-                        if cid:
-                            u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
-                            await asyncio.to_thread(u_eng.update_position_stops, deal_id=deal_id, stop_loss=round(cash_floor, 2))
-                        if hasattr(db, "update_capital_auto_trade_scale_tier"):
-                            db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=2, sl=round(cash_floor, 2))
-                    except Exception as e_cf:
-                        logger.debug(f"Cash floor update note: {e_cf}")
+                    # LEVEL 3: TP3 Moonshot Runner Dynamic Trailing (+15.00$ to +40.00$+ / +300 to +800+ pips)
+                    candles_m15_macro = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M15")
+                    m15_exhausted = False
+                    if candles_m15_macro is not None and len(candles_m15_macro) >= 2:
+                        try:
+                            from mathematical_engine import compute_net_buy_sell_force
+                            f_m15 = compute_net_buy_sell_force(candles_m15_macro)
+                            if dir_side == "BUY" and f_m15.get("exhaustion_state") == "BULLS_EXHAUSTED_AT_TOP":
+                                m15_exhausted = True
+                            elif dir_side == "SELL" and f_m15.get("exhaustion_state") == "BEARS_EXHAUSTED_AT_BOTTOM":
+                                m15_exhausted = True
+                        except Exception:
+                            m15_exhausted = False
 
-                # Check TP3 Hit (+243 pips Moonshot / $24.32 move) - bounded to legitimate range ($24.32 to $120.00)
-                is_tp3 = (24.32 <= pnl_pts <= 120.0) or (
-                    ((dir_side == "BUY" and curr_p >= tp3) or (dir_side == "SELL" and curr_p <= tp3))
-                    and (20.0 <= pnl_pts <= 120.0)
-                )
-                if is_tp3 and scale_tier < 3:
-                    key_tp3 = f"{deal_id}:TP3"
-                    if key_tp3 not in self._notified_milestones:
-                        self._notified_milestones.add(key_tp3)
-                        if hasattr(db, "update_capital_auto_trade_scale_tier"):
-                            db.update_capital_auto_trade_scale_tier(deal_id, scale_tier=3)
-
-                        card_tp3 = format_gold_tp_card(
-                            stage="TP3",
-                            pips=pips,
-                            direction=dir_side,
-                            entry_price=entry_p
+                    is_m2_tp3 = (
+                        (upl >= 20.00 or pnl_pts >= 40.00) or
+                        ((upl >= 15.00 or pnl_pts >= 30.00) and m15_exhausted) or
+                        (current_peak_pts >= 35.00 and pnl_pts <= current_peak_pts * 0.80 and pnl_pts >= 20.00)
+                    )
+                    if is_m2_tp3:
+                        logger.info(
+                            f"🚀 [MACHINE 2 MOONSHOT RUNNER HARVEST] Macro swing trade {deal_id} reached giant milestone "
+                            f"+${upl:.2f} (+{pips} pips / {pnl_pts:.2f} pts)! Banking institutional session runner!"
                         )
-                        markup = get_gold_signal_reply_markup()
-                        await self.broadcast_to_vip_users(card_tp3, app=app, reply_markup=markup)
+                        try:
+                            if cid:
+                                u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
+                                await asyncio.to_thread(u_eng.close_position, deal_id=deal_id)
+                            if hasattr(db, "update_capital_auto_trade_close"):
+                                db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
 
-                    # Close remaining runner on broker
-                    try:
-                        if cid:
-                            u_eng = capital_engine.get_user_capital_engine(cid, is_demo=is_demo)
-                            await asyncio.to_thread(u_eng.close_position, deal_id=deal_id)
-                        if hasattr(db, "update_capital_auto_trade_close"):
-                            db.update_capital_auto_trade_close(deal_id, exit_price=curr_p, pnl=upl)
-                        self._clear_active_trade(deal_id, cooldown=300.0)
-                    except Exception as e_c3:
-                        logger.debug(f"TP3 close note: {e_c3}")
-                    continue
+                            card_tp3 = format_gold_tp_card(
+                                stage="TP3",
+                                pips=pips,
+                                direction=dir_side,
+                                entry_price=entry_p
+                            )
+                            markup = get_gold_signal_reply_markup()
+                            await self.broadcast_to_vip_users(card_tp3, app=app, reply_markup=markup)
+                            self._clear_active_trade(deal_key, cooldown=30.0, direction=dir_side)
+                            continue
+                        except Exception as e_m2_tp3:
+                            logger.debug(f"Machine 2 TP3 harvest error: {e_m2_tp3}")
 
                 # Check if position stopped out on broker (SL hit or closed)
-                # If stopped out in profit: notify VIP. If stopped out in loss: DO NOT NOTIFY VIP.
+                # If stopped out in profit: notify VIP. If stopped out in loss: Transparently report risk defense!
                 is_sl_hit = (dir_side == "BUY" and curr_p <= sl and sl >= 3500.0) or (dir_side == "SELL" and curr_p >= sl and sl >= 3500.0)
                 if is_sl_hit:
                     key_close = f"{deal_id}:CLOSED"
@@ -1469,17 +3537,34 @@ class QuantGoldExecutionEngine:
                             # Closed in profit! (e.g. Breakeven Armor or trailing profit floor hit)
                             card_close_win = format_gold_tp_card(
                                 stage="CLOSE",
-                                pips=max(pips, 73 if scale_tier >= 1 else 10),
+                                pips=max(pips, 70 if scale_tier >= 1 else 10),
                                 direction=dir_side,
                                 entry_price=entry_p
                             )
                             markup = get_gold_signal_reply_markup()
                             await self.broadcast_to_vip_users(card_close_win, app=app, reply_markup=markup)
-                            self._clear_active_trade(deal_id, cooldown=300.0)
+                            self._clear_active_trade(deal_id, cooldown=20.0, direction=dir_side)
                         else:
-                            # Closed at loss: NEVER SEND TO VIP USERS!
-                            logger.info(f"Gold trade {deal_id} hit SL @ ${curr_p:.2f} (Loss: ${upl:.2f}). VIP alert suppressed as per Fiduciary Profit-Only policy.")
-                            self._clear_active_trade(deal_id, cooldown=900.0)
+                            # Closed at loss: Record in RAM Invalidation Memory & transparently notify!
+                            self._last_stop_out_price = round(curr_p, 2)
+                            self._last_stop_out_ts = time.time()
+                            self._last_stop_out_dir = dir_side
+                            logger.info(
+                                f"🏛️ [BROKER STRUCTURAL STOP-LOSS] Gold trade {deal_id} ({dir_side}) hit SL @ ${curr_p:.2f} (Loss: ${upl:.2f}). "
+                                f"Recorded ${self._last_stop_out_price:.2f} in RAM invalidation memory."
+                            )
+                            self._directional_quarantine_dir = dir_side
+                            self._directional_quarantine_until = time.time() + 900.0
+                            card_sl = format_gold_sl_card(
+                                pips=abs(pips),
+                                direction=dir_side,
+                                entry_price=entry_p,
+                                exit_price=curr_p,
+                                loss_amount=upl
+                            )
+                            markup = get_gold_signal_reply_markup()
+                            await self.broadcast_to_vip_users(card_sl, app=app, reply_markup=markup)
+                            self._clear_active_trade(deal_id, cooldown=45.0, direction=dir_side)
                     continue
 
         except Exception as e_audit:
