@@ -1655,9 +1655,9 @@ class QuantGoldExecutionEngine:
                     cur_en = bool(auto_cfg.get("enabled", False) or auto_cfg.get("is_enabled", False))
                     cur_demo = bool(auto_cfg.get("is_demo", False))
                     existing_b = float(auto_cfg.get("budget", 0.0) or 0.0)
-                    target_budget = existing_b if existing_b > 0 else round(max(10.0, min(live_avail * 0.20, 100.0)), 2)
+                    target_budget = round(live_avail, 2) if (live_avail >= 100.0 and existing_b < 100.0) else (existing_b if existing_b > 0 else round(max(10.0, min(live_avail * 0.20, 100.0)), 2))
                     
-                    if not cur_en or cur_demo:
+                    if not cur_en or cur_demo or (live_avail >= 100.0 and existing_b < 100.0):
                         db.set_capital_auto_config(
                             chat_id=cid,
                             enabled=True,
@@ -1665,7 +1665,7 @@ class QuantGoldExecutionEngine:
                             max_positions=5,
                             is_demo=False
                         )
-                        logger.info(f"🟢 [FLEET LIVE ACTIVATED] User {cid} (Account {acc_id}) has ${live_avail:.2f} available. Auto-switched to LIVE MAINNET trading!")
+                        logger.info(f"🟢 [FLEET LIVE ACTIVATED] User {cid} (Account {acc_id}) has ${live_avail:.2f} available. Auto-synchronized budget to ${target_budget:.2f} LIVE!")
                         results[cid] = {"status": "LIVE_ACTIVATED", "available": live_avail, "budget": target_budget}
                     else:
                         results[cid] = {"status": "LIVE_ACTIVE", "available": live_avail}
@@ -2354,7 +2354,8 @@ class QuantGoldExecutionEngine:
                                 effective_is_demo = True
                             else:
                                 effective_is_demo = False
-                                budget = max(10.0, min(budget, live_avail * 0.50))
+                                # Synchronize real capital: If live available is >= $100, use real available capital
+                                budget = max(budget, live_avail) if live_avail >= 50.0 else max(10.0, live_avail)
                         except Exception as e_bal:
                             logger.debug(f"Live balance audit note for user {cid}: {e_bal}")
                             effective_is_demo = True
@@ -2546,8 +2547,9 @@ class QuantGoldExecutionEngine:
                     # Dynamic Risk-Bounded Lot Sizing (AQ88 Invariant 134):
                     # Guarantees dollar risk on accounts is safely proportioned to equity (2.5% - 3.5%)
                     # For accounts >= $100, guarantees standard 0.50 oz can be placed smoothly with breathing SL (10-18 pts)!
-                    if effective_budget >= 100.0:
-                        max_allowed_dollar_risk = max(10.00, effective_budget * 0.035)
+                    real_cap = max(effective_budget, float(live_avail or 0.0) if not effective_is_demo else 0.0)
+                    if real_cap >= 100.0:
+                        max_allowed_dollar_risk = max(10.00, real_cap * 0.035)
                         risk_clamped_lot = round(max_allowed_dollar_risk / max(1.0, sl_dist), 2)
                         lot_size = max(0.50, min(lot_size, max(0.50, risk_clamped_lot)))
                     else:
