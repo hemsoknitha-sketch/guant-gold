@@ -2007,6 +2007,16 @@ class CapitalComEngine:
                     )
                     reason = str(raw_reason).strip()
                     deal_id = data.get("dealId")
+                    affected_deals = data.get("affectedDeals") or []
+                    pos_deal_id = None
+                    if isinstance(affected_deals, list) and affected_deals:
+                        for ad in affected_deals:
+                            if isinstance(ad, dict) and ad.get("dealId") and str(ad.get("status", "")).upper() in ("OPENED", "OPEN"):
+                                pos_deal_id = str(ad.get("dealId"))
+                                break
+                        if not pos_deal_id and affected_deals and isinstance(affected_deals[0], dict):
+                            pos_deal_id = str(affected_deals[0].get("dealId"))
+                    effective_deal_id = pos_deal_id or deal_id or deal_reference
                     level = data.get("level")
                     is_accepted = (deal_status == "ACCEPTED" or status in ["OPEN", "ACCEPTED"])
                     is_rejected = (deal_status == "REJECTED" or status == "REJECTED")
@@ -2020,7 +2030,7 @@ class CapitalComEngine:
                             "deal_status": deal_status,
                             "status": status,
                             "reason": reason,
-                            "deal_id": deal_id,
+                            "deal_id": effective_deal_id,
                             "level": level,
                             "data": data
                         }
@@ -2031,7 +2041,7 @@ class CapitalComEngine:
                             "deal_status": deal_status,
                             "status": status,
                             "reason": reason,
-                            "deal_id": deal_id or deal_reference,
+                            "deal_id": effective_deal_id,
                             "level": level,
                             "data": data
                         }
