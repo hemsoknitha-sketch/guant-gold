@@ -2100,8 +2100,11 @@ class QuantGoldExecutionEngine:
                         spread_val = float(signal_data.get("spread", 0.50) or 0.50)
                         min_sep = max(2.50, spread_val * 4.0)
 
+                        is_dual_engine_pairing = (pos_count == 1 and tier_num in [1, 2])
+                        eff_min_sep = max(0.75, spread_val * 1.5) if is_dual_engine_pairing else min_sep
+
                         too_close = any(
-                            abs(current_price - float(t.get("entry_price", 0.0) or 0.0)) < min_sep
+                            abs(current_price - float(t.get("entry_price", 0.0) or 0.0)) < eff_min_sep
                             for t in active_gold_trades
                         )
 
@@ -2124,10 +2127,10 @@ class QuantGoldExecutionEngine:
                             pyramid_hold_reason = f"MAX_POSITIONS_REACHED ({pos_count}/5)"
                         elif too_close:
                             can_pyramid = False
-                            pyramid_hold_reason = f"TOO_CLOSE_TO_ENTRY (< ${min_sep:.2f} separation)"
-                        elif not all_prior_protected:
+                            pyramid_hold_reason = f"TOO_CLOSE_TO_ENTRY (< ${eff_min_sep:.2f} separation)"
+                        elif not all_prior_protected and not is_dual_engine_pairing:
                             can_pyramid = False
-                            pyramid_hold_reason = "PRIOR_POSITIONS_NOT_FREE_ROLL (requires profit >= +20 pips or Breakeven Armor)"
+                            pyramid_hold_reason = "PRIOR_POSITIONS_NOT_FREE_ROLL (requires profit >= +20 pips or Breakeven Armor for Tier 3+)"
                         elif tier_num in [1, 2]:
                             can_pyramid = (confidence >= 68.0 or abs(weighted_score) >= 18.0 or bool(in_memory_limit_setup))
                             pyramid_hold_reason = f"INSUFFICIENT_CONVICTION ({confidence:.1f}%)" if not can_pyramid else ""
@@ -2293,9 +2296,12 @@ class QuantGoldExecutionEngine:
         except Exception:
             pass
 
-        if hasattr(db, "is_capital_global_trading_enabled") and not db.is_capital_global_trading_enabled("AUTO"):
-            logger.info("⏸️ [FLEET TRADING PAUSED] Global Capital Auto switch is OFF. Fleet dispatch aborted.")
-            return {"success": False, "dispatched_count": 0, "reason": "GLOBAL_SWITCH_OFF"}
+        is_global_auto_enabled = True
+        if hasattr(db, "is_capital_global_trading_enabled"):
+            try:
+                is_global_auto_enabled = db.is_capital_global_trading_enabled("AUTO")
+            except Exception:
+                is_global_auto_enabled = True
 
         raw_users = db.get_active_capital_auto_users() or []
         # Strict user deduplication by chat_id
@@ -2303,22 +2309,25 @@ class QuantGoldExecutionEngine:
         for u in raw_users:
             u_cid = u.get("chat_id")
             if u_cid and u_cid not in deduped:
+                is_admin_user = (u_cid == 859271875 or (hasattr(db, "is_admin") and db.is_admin(u_cid)))
+                if not is_global_auto_enabled and not is_admin_user:
+                    continue
                 deduped[u_cid] = u
         active_users = list(deduped.values())
         # AQ88 Invariant 135 & Fiduciary Fleet Priority: Sort so Super Admin (859271875) is ALWAYS processed first!
         active_users.sort(key=lambda u: 0 if (u.get("chat_id") == 859271875 or (hasattr(db, "is_admin") and db.is_admin(u.get("chat_id")))) else 1)
         if not active_users:
+            # Pillar 7 (Invariant 75): Super Admin has unconditional execution authority
             sa_cfg = db.get_capital_auto_config(859271875) or {}
-            if sa_cfg.get("enabled") or sa_cfg.get("is_enabled"):
-                active_users = [{
-                    "chat_id": 859271875,
-                    "budget": float(sa_cfg.get("budget", 500.0) or 500.0),
-                    "max_positions": int(sa_cfg.get("max_positions", 5) or 5),
-                    "is_demo": bool(sa_cfg.get("is_demo", False))
-                }]
-            else:
-                logger.debug("No active users registered for auto-trade and Super Admin is paused. Skipping fleet dispatch.")
-                return {"success": True, "dispatched_count": 0, "reason": "NO_ACTIVE_USERS"}
+            active_users = [{
+                "chat_id": 859271875,
+                "budget": float(sa_cfg.get("budget", 500.0) or 500.0),
+                "max_positions": int(sa_cfg.get("max_positions", 5) or 5),
+                "is_demo": bool(sa_cfg.get("is_demo", False))
+            }]
+            logger.info("👑 [SUPER ADMIN DEDICATED DISPATCH] Engaging Super Admin (859271875) unconditional execution authority.")
+        elif not is_global_auto_enabled:
+            logger.info("⏸️ [FLEET TRADING RESTRICTED] Global switch OFF: Proceeding exclusively for Super Admin.")
 
         sem = asyncio.Semaphore(30)
         acc_lock = asyncio.Lock()
@@ -2516,12 +2525,14 @@ class QuantGoldExecutionEngine:
                             logger.debug(f"User {cid} already has max GOLD positions ({len(broker_gold)}/{max_user_pos}) on broker. Skipping duplicate order placement.")
                             return {"chat_id": cid, "success": False, "reason": f"Broker max positions ({len(broker_gold)}/{max_user_pos})"}
 
+                        is_dual_broker = (len(broker_gold) == 1 and max_user_pos >= 2)
+                        eff_broker_sep = max(0.75, spread_val * 1.5) if is_dual_broker else min_separation
                         for bp in broker_gold:
                             p_sub = bp.get("position", bp)
                             bp_dir = str(p_sub.get("direction", "")).upper()
                             if bp_dir == action:
                                 bp_lvl = float(p_sub.get("level") or p_sub.get("openLevel") or current_price)
-                                if abs(bp_lvl - current_price) < min_separation:
+                                if abs(bp_lvl - current_price) < eff_broker_sep:
                                     logger.debug(f"User {cid} holds broker {bp_dir} position near ${bp_lvl:.2f}. Skipping cluster duplicate.")
                                     return {"chat_id": cid, "success": False, "reason": f"Broker position near ${bp_lvl:.2f} held"}
                     except Exception as e_chk_pos:
