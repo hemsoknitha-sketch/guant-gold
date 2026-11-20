@@ -438,9 +438,14 @@ class QuantGoldExecutionEngine:
             for t in active_trades:
                 d_id = str(t.get("deal_id", ""))
                 if str(t.get("epic", "")).upper() == "GOLD" and str(t.get("status", "OPEN")).upper() == "OPEN" and not d_id.startswith("MANUAL_"):
+                    e_p = float(t.get("entry_price", 0.0) or 0.0)
+                    if e_p < 3000.0 or e_p > 6000.0:
+                        if hasattr(db, "update_capital_auto_trade_close"):
+                            db.update_capital_auto_trade_close(d_id, exit_price=e_p, pnl=0.0)
+                        continue
                     self._active_gold_deal_id = d_id
                     self._active_gold_direction = str(t.get("direction", "BUY")).upper()
-                    self._active_gold_entry_price = float(t.get("entry_price", 0.0) or 0.0)
+                    self._active_gold_entry_price = e_p
                     self._active_gold_entry_ts = float(t.get("created_at_ts", 0.0) or 0.0)
                     self._active_gold_sl = float(t.get("sl", 0.0) or 0.0)
                     self._active_gold_tp1 = float(t.get("tp1", 0.0) or 0.0)
@@ -466,12 +471,20 @@ class QuantGoldExecutionEngine:
         res = []
         try:
             active_trades = db.get_active_capital_auto_trades() if hasattr(db, "get_active_capital_auto_trades") else []
-            res = [
-                t for t in active_trades
-                if str(t.get("epic", "")).upper() == "GOLD"
-                and str(t.get("status", "OPEN")).upper() == "OPEN"
-                and not str(t.get("deal_id", "")).startswith("MANUAL_")
-            ]
+            for t in active_trades:
+                if str(t.get("epic", "")).upper() != "GOLD":
+                    continue
+                if str(t.get("status", "OPEN")).upper() != "OPEN":
+                    continue
+                if str(t.get("deal_id", "")).startswith("MANUAL_"):
+                    continue
+                e_p = float(t.get("entry_price", 0.0) or 0.0)
+                if e_p < 3000.0 or e_p > 6000.0:
+                    d_id = t.get("deal_id")
+                    if d_id and hasattr(db, "update_capital_auto_trade_close"):
+                        db.update_capital_auto_trade_close(str(d_id), exit_price=e_p, pnl=0.0)
+                    continue
+                res.append(t)
         except Exception:
             res = []
 
@@ -1920,11 +1933,13 @@ class QuantGoldExecutionEngine:
 
                         # Check existing trade floating pnl to protect capital
                         existing_entry_p = self._active_gold_entry_price
-                        if existing_entry_p <= 0.0 and active_gold_trades:
+                        if (existing_entry_p < 3000.0 or existing_entry_p > 6000.0) and active_gold_trades:
                             try:
                                 existing_entry_p = float(active_gold_trades[0].get("entry_price", current_price) or current_price)
                             except Exception:
                                 existing_entry_p = current_price
+                        if existing_entry_p < 3000.0 or existing_entry_p > 6000.0:
+                            existing_entry_p = current_price
                         existing_pnl_pts = (current_price - existing_entry_p) if existing_dir == "BUY" else (existing_entry_p - current_price)
                         is_existing_profitable = (existing_pnl_pts >= 1.20)
                         is_existing_losing = (existing_pnl_pts <= -2.50)

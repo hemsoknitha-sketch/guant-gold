@@ -4751,6 +4751,17 @@ def ensure_capital_super_admin_defaults():
             except Exception:
                 pass
         print("🛡️ [PURGE] Completely purged erroneous ghost ID 331963468 from all system tables!")
+        # 8.1 Purge corrupted/legacy Gold trades with entry_price outside sane bounds ($3000 - $6000)
+        try:
+            cursor.execute("""
+                UPDATE capital_auto_trades
+                SET status = 'CLOSED', closed_at = CURRENT_TIMESTAMP
+                WHERE (epic = 'GOLD' OR epic LIKE '%GOLD%')
+                AND (entry_price < 3000.0 OR entry_price > 6000.0)
+                AND (status = 'OPEN' OR status LIKE 'ACTIVE%')
+            """)
+        except Exception:
+            pass
 
         # 9. Seed & Approve VIP User @chengphol (Cheng Phol, Telegram ID: 643724109) - Sole Owner of Live Account 331963468326458564
         cheng_cid = 643724109
