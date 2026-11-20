@@ -1163,6 +1163,33 @@ class QuantGoldExecutionEngine:
             if mtf_action == tv_dir or ai_action == tv_dir:
                 win_prob = min(94.5, win_prob + 4.0)
 
+        # Institutional Net Order Flow Force & Climax Exhaustion Pre-computation (In RAM)
+        nof_data = math_data.get("net_order_flow_force", {})
+        ex_state = nof_data.get("exhaustion_state", "NEUTRAL_BALANCED")
+        candles_m5 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
+        nof_m5 = {}
+        if candles_m5 is not None and len(candles_m5) >= 5:
+            try:
+                from mathematical_engine import compute_net_buy_sell_force
+                nof_m5 = compute_net_buy_sell_force(candles_m5, kalman_velocity=kalman.get("latent_velocity", 0.0))
+            except Exception:
+                nof_m5 = {}
+        ex_state_m5 = nof_m5.get("exhaustion_state", "NEUTRAL_BALANCED")
+
+        # Multi-factor Exhaustion Confirmation at Dealing Range Boundaries (AQ88 Invariant 138)
+        is_bottom_exhaustion_confirmed = (
+            ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" or
+            ex_state_m5 == "BEARS_EXHAUSTED_AT_BOTTOM" or
+            bool(tv_matrix.get("bottom_climax_buy", False)) or
+            (range_pct <= 0.40 and (float(nof_data.get("lower_wick_ratio", 0.0) or 0.0) >= 0.30 or float(nof_m5.get("lower_wick_ratio", 0.0) or 0.0) >= 0.30) and float(nof_data.get("buy_force_pct", 50.0) or 50.0) >= 48.0)
+        )
+        is_top_exhaustion_confirmed = (
+            ex_state == "BULLS_EXHAUSTED_AT_TOP" or
+            ex_state_m5 == "BULLS_EXHAUSTED_AT_TOP" or
+            bool(tv_matrix.get("top_climax_sell", False)) or
+            (range_pct >= 0.60 and (float(nof_data.get("upper_wick_ratio", 0.0) or 0.0) >= 0.30 or float(nof_m5.get("upper_wick_ratio", 0.0) or 0.0) >= 0.30) and float(nof_data.get("sell_force_pct", 50.0) or 50.0) >= 48.0)
+        )
+
         # Gate 1: Check MTF and AI alignment or decisive weighted score
         cand_action = mtf_action if mtf_action in ["BUY", "SELL"] else (ai_action if ai_action in ["BUY", "SELL"] else None)
         has_consensus = (mtf_action in ["BUY", "SELL"] and (mtf_action == ai_action or ai_action == "HOLD" or abs(weighted_score) >= 30.0))
@@ -1176,14 +1203,31 @@ class QuantGoldExecutionEngine:
         m15_atr_gate = float(m15_tf.get("atr", 6.5) or 6.5)
 
         if has_consensus and cand_action in ["BUY", "SELL"]:
-            # Gate 1.5: Top-Down Macro Trend Alignment Veto (AQ88 Invariant 123)
-            # Catching falling knives in a confirmed Macro Downtrend is officially forbidden!
-            if cand_action == "BUY" and is_macro_bear:
+            # Gate 1.4: Institutional Discount / Premium Auction Market Law (AQ88 Invariant 138)
+            # Smart Money Principle: NEVER SELL IN DISCOUNT! NEVER BUY IN PREMIUM!
+            if cand_action == "SELL" and range_pct <= 0.38 and not is_top_exhaustion_confirmed:
                 final_action = "HOLD"
-                reason = f"H1_H4_MACRO_BEAR_VETO: Price ${curr_p:.2f} is in confirmed Macro Downtrend ({bearish_tf_count}/19 Bearish TFs, H1={h1_bias}, H4={h4_bias}). Buying falling knives or bear flag pullbacks is strictly forbidden."
+                reason = f"VETO_SELL_IN_DISCOUNT_BOTTOM: Price ${curr_p:.2f} is in Discount ({range_pct*100:.1f}% of Dealing Range ${range_low:.2f}-${range_high:.2f}). Selling into discount support is retail suicide."
+            elif cand_action == "BUY" and range_pct >= 0.62 and not is_bottom_exhaustion_confirmed:
+                final_action = "HOLD"
+                reason = f"VETO_BUY_IN_PREMIUM_TOP: Price ${curr_p:.2f} is in Premium ({range_pct*100:.1f}% of Dealing Range ${range_low:.2f}-${range_high:.2f}). Buying into premium resistance is retail FOMO."
+            # Gate 1.5: Top-Down Macro Trend Alignment Veto with Climax Exhaustion Overrides (AQ88 Invariant 123 & 138)
+            elif cand_action == "BUY" and is_macro_bear:
+                if is_bottom_exhaustion_confirmed:
+                    final_action = "BUY"
+                    win_prob = max(win_prob, 86.0)
+                    reason = f"MACRO_BEAR_OVERRIDDEN_BY_BOTTOM_EXHAUSTION_BUY: Price ${curr_p:.2f} reached Range Low ${range_low:.2f} (Discount {range_pct*100:.1f}%). Absorption wick & buy force surge confirmed in RAM. Overriding macro bear to harvest bottom reversal!"
+                else:
+                    final_action = "HOLD"
+                    reason = f"H1_H4_MACRO_BEAR_VETO: Price ${curr_p:.2f} is in confirmed Macro Downtrend ({bearish_tf_count}/19 Bearish TFs, H1={h1_bias}, H4={h4_bias}). Buying falling knives without bottom exhaustion is strictly forbidden."
             elif cand_action == "SELL" and is_macro_bull:
-                final_action = "HOLD"
-                reason = f"H1_H4_MACRO_BULL_VETO: Price ${curr_p:.2f} is in confirmed Macro Uptrend ({bullish_tf_count}/19 Bullish TFs, H1={h1_bias}, H4={h4_bias}). Shorting tops or bull flags is strictly forbidden."
+                if is_top_exhaustion_confirmed:
+                    final_action = "SELL"
+                    win_prob = max(win_prob, 86.0)
+                    reason = f"MACRO_BULL_OVERRIDDEN_BY_TOP_EXHAUSTION_SELL: Price ${curr_p:.2f} reached Range High ${range_high:.2f} (Premium {range_pct*100:.1f}%). Rejection wick & sell force surge confirmed in RAM. Overriding macro bull to harvest top reversal!"
+                else:
+                    final_action = "HOLD"
+                    reason = f"H1_H4_MACRO_BULL_VETO: Price ${curr_p:.2f} is in confirmed Macro Uptrend ({bullish_tf_count}/19 Bullish TFs, H1={h1_bias}, H4={h4_bias}). Shorting tops without top exhaustion is strictly forbidden."
             # Gate 2: Equilibrium Chop Zone Injunction (Middle 30% Dealing Range is FORBIDDEN - Invariant 76 & AQ88 Invariant 137)
             elif is_chop_zone and abs(weighted_score) < 35.0 and abs(kalman.get("latent_velocity", 0.0)) < 0.04:
                 final_action = "HOLD"
@@ -1263,10 +1307,31 @@ class QuantGoldExecutionEngine:
         )
 
         if final_action == "HOLD":
-            # 1. Trend Pullback Setups (Trading WITH the Dominant Trend):
+            # Priority 0: Range Boundary Exhaustion Reversals (Bottom Reversal Buy / Top Reversal Sell)
+            # When price is in extreme Discount (<= 0.42) and Bears Exhausted -> BUY!
+            # When price is in extreme Premium (>= 0.58) and Bulls Exhausted -> SELL!
+            if is_bottom_exhaustion_confirmed and (range_pct <= 0.42 or curr_p <= m15_ema21 - (0.30 * m15_atr_gate)):
+                rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
+                m5_rsi_val = float(m5_tf.get("rsi", 50.0) or 50.0)
+                b_f = float(nof_data.get("buy_force_pct", 50.0) or 50.0)
+                l_w = max(float(nof_data.get("lower_wick_ratio", 0.0) or 0.0), float(nof_m5.get("lower_wick_ratio", 0.0) or 0.0))
+                if (rsi_val <= 50.0 or m5_rsi_val <= 48.0) and k_vel >= -0.025:
+                    final_action = "BUY"
+                    win_prob = max(win_prob, 86.0)
+                    reason = f"RANGE_BOUNDARY_EXHAUSTED_BOTTOM_BUY: Net Order Flow Bears Exhausted at Range Bottom ${range_low:.2f} (Discount {range_pct*100:.1f}%, Buy Force {b_f:.0f}%, Lower Wick {l_w*100:.1f}%). Harvesting bottom reversal bounce!"
+            elif is_top_exhaustion_confirmed and (range_pct >= 0.58 or curr_p >= m15_ema21 + (0.30 * m15_atr_gate)):
+                rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
+                m5_rsi_val = float(m5_tf.get("rsi", 50.0) or 50.0)
+                s_f = float(nof_data.get("sell_force_pct", 50.0) or 50.0)
+                u_w = max(float(nof_data.get("upper_wick_ratio", 0.0) or 0.0), float(nof_m5.get("upper_wick_ratio", 0.0) or 0.0))
+                if (rsi_val >= 50.0 or m5_rsi_val >= 52.0) and k_vel <= 0.025:
+                    final_action = "SELL"
+                    win_prob = max(win_prob, 86.0)
+                    reason = f"RANGE_BOUNDARY_EXHAUSTED_TOP_SELL: Net Order Flow Bulls Exhausted at Range Top ${range_high:.2f} (Premium {range_pct*100:.1f}%, Sell Force {s_f:.0f}%, Upper Wick {u_w*100:.1f}%). Harvesting top reversal drop!"
+            # Priority 1: Trend Pullback Setups (Trading WITH the Dominant Trend when not at boundaries):
             # Machine 1: M5 Trigger aligned 100% with M15 Direction (Choch/BOS, EMA Confluence)
             # Equilibrium Guard: Pullback MUST be in discount (range_pct < 0.45) for BUY, or premium (range_pct > 0.55) for SELL
-            if is_intraday_bull and not is_macro_bear:
+            elif is_intraday_bull and not is_macro_bear:
                 # In an M15 UPTREND: We ONLY BUY M5 PULLBACKS into discount! Selling against the bull trend is 100% FORBIDDEN.
                 # Price MUST have pulled back down near/below M15 EMA21 in Discount (not at the top or equilibrium chop)!
                 is_m5_dip = (curr_p <= m15_ema21 + (0.35 * m15_atr_gate)) and (range_pct <= 0.45 or not is_chop_zone)
@@ -1296,33 +1361,19 @@ class QuantGoldExecutionEngine:
                         final_action = "SELL"
                         win_prob = max(win_prob, 85.0)
                         reason = f"MACHINE_1_M5_PULLBACK_SELL: Rally in M15 Bear trend exhausted buyers on M5 (Sell Force {nof_m5.get('sell_force_pct', 70)}%, M5 RSI {m5_rsi:.1f}, Kalman Vel {k_vel:+.4f})."
-            else:
-                # 2. Consolidation / Range Boundaries ONLY (Strict Exhaustion Criteria at Outer Boundaries):
-                if not is_chop_zone:
-                    if ex_state == "BULLS_EXHAUSTED_AT_TOP" and not is_intraday_bull and weighted_score <= 5.0 and (curr_p >= m15_ema21 - (0.30 * m15_atr_gate)):
-                        rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
-                        s_f = float(nof_data.get("sell_force_pct", 50.0) or 50.0)
-                        u_w = float(nof_data.get("upper_wick_ratio", 0.0) or 0.0)
-                        if rsi_val >= 58.0 and k_vel <= -0.015 and s_f >= 60.0 and u_w >= 0.35:
-                            final_action = "SELL"
-                            win_prob = max(win_prob, 82.0)
-                            reason = f"RANGE_BOUNDARY_EXHAUSTED_TOP_SELL: Net Order Flow Bulls Exhausted at Range Top (Sell Force {s_f:.0f}%, Upper Wick {u_w*100:.1f}%, Kalman Vel {k_vel:+.4f})."
-                    elif ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" and not is_intraday_bear and weighted_score >= -5.0 and (curr_p <= m15_ema21 + (0.30 * m15_atr_gate)):
-                        rsi_val = float(m15_tf.get("rsi", 50.0) or 50.0)
-                        b_f = float(nof_data.get("buy_force_pct", 50.0) or 50.0)
-                        l_w = float(nof_data.get("lower_wick_ratio", 0.0) or 0.0)
-                        if rsi_val <= 42.0 and k_vel >= 0.015 and b_f >= 60.0 and l_w >= 0.35:
-                            final_action = "BUY"
-                            win_prob = max(win_prob, 82.0)
-                            reason = f"RANGE_BOUNDARY_EXHAUSTED_BOTTOM_BUY: Net Order Flow Bears Exhausted at Range Bottom (Buy Force {b_f:.0f}%, Lower Wick {l_w*100:.1f}%, Kalman Vel {k_vel:+.4f})."
 
         # Structural Invalidation Memory Anchor in RAM (AQ88 Invariant 137)
-        # Prevents re-entering the exact same price noise level within 2.50 pts of a recent stop out
+        # Prevents re-entering the exact same price noise level within 5.00 pts of a recent stop out
         last_sl_p = getattr(self, "_last_stop_out_price", 0.0)
         last_sl_ts = getattr(self, "_last_stop_out_ts", 0.0)
         if final_action in ["BUY", "SELL"] and last_sl_p > 0.0 and (time.time() - last_sl_ts) < 900.0:
             dist_from_stop = abs(curr_p - last_sl_p)
-            if dist_from_stop < 2.50:
+            if dist_from_stop < 5.00:
+                sweep_m15 = str(smc_m15.get("sweep", "NONE")).upper()
+                has_boundary_sweep = (sweep_m15 not in ["NONE", ""]) or (float(nof_data.get("upper_wick_ratio", 0.0) or 0.0) >= 0.38) or (float(nof_data.get("lower_wick_ratio", 0.0) or 0.0) >= 0.38)
+                if not has_boundary_sweep:
+                    final_action = "HOLD"
+                    reason = f"STRUCTURAL_INVALIDATION_RAM_HOLD: Price ${curr_p:.2f} is within {dist_from_stop:.2f} pts of recent SL (${last_sl_p:.2f}). Holding in RAM until boundary sweep or structural expansion."
                 sweep_m15 = str(smc_m15.get("sweep", "NONE")).upper()
                 has_boundary_sweep = (sweep_m15 not in ["NONE", ""]) or (float(nof_data.get("upper_wick_ratio", 0.0) or 0.0) >= 0.38) or (float(nof_data.get("lower_wick_ratio", 0.0) or 0.0) >= 0.38)
                 if not has_boundary_sweep:
@@ -1869,7 +1920,7 @@ class QuantGoldExecutionEngine:
                                 existing_entry_p = current_price
                         existing_pnl_pts = (current_price - existing_entry_p) if existing_dir == "BUY" else (existing_entry_p - current_price)
                         is_existing_profitable = (existing_pnl_pts >= 1.20)
-                        is_existing_losing = (existing_pnl_pts <= -0.50)
+                        is_existing_losing = (existing_pnl_pts <= -2.50)
 
                         # Dynamic anti-whipsaw cooldown: 180s (3 minutes) to prevent chop churn
                         rev_cooldown_left = 180.0 - (now_ts - last_rev_ts)
@@ -1896,6 +1947,11 @@ class QuantGoldExecutionEngine:
                         if m15_atr <= 0.5:
                             m15_atr = 6.5
 
+                        # SMC Dealing Range for Reversal Flip (AQ88 Invariant 138)
+                        smc_flip = m15_info.get("smc", {})
+                        range_pct_flip = float(smc_flip.get("range_pct", 0.50) or 0.50)
+                        tv_matrix_flip = signal_data.get("math_summary", {}).get("tradingview_matrix", {})
+
                         can_flip = False
                         flip_veto_reason = ""
 
@@ -1909,8 +1965,10 @@ class QuantGoldExecutionEngine:
                         elif time_in_pos < min_hold_req:
                             flip_veto_reason = f"MIN_HOLD_PROTECTION (in position {time_in_pos:.0f}s < {min_hold_req:.0f}s)"
                         elif action == "BUY":
-                            if is_macro_bear:
-                                flip_veto_reason = "MACRO_BEAR_VETO (Cannot flip to BUY against H1/H4 Downtrend)"
+                            if range_pct_flip >= 0.60:
+                                flip_veto_reason = f"PREMIUM_ZONE_REVERSAL_BUY_BLOCKED (Price ${current_price:.2f} is in Premium {range_pct_flip*100:.1f}%. Flipping into BUY at range top is retail FOMO!)"
+                            elif is_macro_bear and ex_state != "BEARS_EXHAUSTED_AT_BOTTOM" and not bool(tv_matrix_flip.get("bottom_climax_buy", False)):
+                                flip_veto_reason = "MACRO_BEAR_VETO (Cannot flip to BUY against H1/H4 Downtrend without bottom exhaustion)"
                             elif weighted_score < 15.0:
                                 flip_veto_reason = f"INSUFFICIENT_BUY_SCORE (Score {weighted_score:+.1f} < +15.0)"
                             elif confidence < 70.0:
@@ -1926,8 +1984,10 @@ class QuantGoldExecutionEngine:
                             else:
                                 can_flip = True
                         elif action == "SELL":
-                            if is_macro_bull:
-                                flip_veto_reason = "MACRO_BULL_VETO (Cannot flip to SELL against H1/H4 Uptrend)"
+                            if range_pct_flip <= 0.40:
+                                flip_veto_reason = f"DISCOUNT_ZONE_REVERSAL_SELL_BLOCKED (Price ${current_price:.2f} is in Discount {range_pct_flip*100:.1f}%. Flipping into SELL at range bottom is retail suicide!)"
+                            elif is_macro_bull and ex_state != "BULLS_EXHAUSTED_AT_TOP" and not bool(tv_matrix_flip.get("top_climax_sell", False)):
+                                flip_veto_reason = "MACRO_BULL_VETO (Cannot flip to SELL against H1/H4 Uptrend without top exhaustion)"
                             elif weighted_score > -15.0:
                                 flip_veto_reason = f"INSUFFICIENT_SELL_SCORE (Score {weighted_score:+.1f} > -15.0)"
                             elif confidence < 70.0:

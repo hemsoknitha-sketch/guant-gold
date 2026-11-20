@@ -311,14 +311,16 @@ def compute_net_buy_sell_force(
     rel_pos = (c_close - rec_low) / rec_rng  # 0.0 = absolute bottom, 1.0 = absolute top
 
     exhaustion_state = "NEUTRAL_BALANCED"
-    if (upper_wick_ratio >= 0.38 and is_red) or (upper_wick_ratio >= 0.48):
-        if kalman_velocity <= 0.005 and sell_force_pct >= 52.0 and rel_pos >= 0.58:
+    # Institutional Bulls Exhausted at Top (Shooting star / Rejection wick at Premium)
+    if (upper_wick_ratio >= 0.35 and is_red) or (upper_wick_ratio >= 0.42) or (upper_wick_ratio >= 0.32 and sell_force_pct >= 52.0):
+        if kalman_velocity <= 0.020 and sell_force_pct >= 50.0 and rel_pos >= 0.55:
             exhaustion_state = "BULLS_EXHAUSTED_AT_TOP"
     elif is_green and upper_wick_ratio < 0.25 and kalman_velocity > 0.010:
         exhaustion_state = "BULL_MOMENTUM_EXPANDING"
 
-    if (lower_wick_ratio >= 0.38 and is_green) or (lower_wick_ratio >= 0.48):
-        if kalman_velocity >= -0.005 and buy_force_pct >= 52.0 and rel_pos <= 0.42:
+    # Institutional Bears Exhausted at Bottom (Hammer / Absorption wick at Discount)
+    if (lower_wick_ratio >= 0.35 and is_green) or (lower_wick_ratio >= 0.42) or (lower_wick_ratio >= 0.32 and buy_force_pct >= 52.0):
+        if kalman_velocity >= -0.020 and buy_force_pct >= 50.0 and rel_pos <= 0.45:
             exhaustion_state = "BEARS_EXHAUSTED_AT_BOTTOM"
     elif is_red and lower_wick_ratio < 0.25 and kalman_velocity < -0.010:
         exhaustion_state = "BEAR_MOMENTUM_PLUNGING"

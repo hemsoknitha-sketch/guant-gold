@@ -1057,14 +1057,19 @@ class TradingViewConfluenceMatrix:
         u_wick = max(0.0, c_high - max(c_open, c_close)) / c_rng
         l_wick = max(0.0, min(c_open, c_close) - c_low) / c_rng
 
-        # Top Climax Exhaustion Rejection (Upper wick >= 35% at OLS Upper Band or VAH)
-        if (current_price >= ols["upper"] - 1.50 or current_price >= vp.get("vah", 9999.0) - 1.50 or z >= 1.65) and u_wick >= 0.35:
-            score -= 30.0
+        top_climax_sell = False
+        bottom_climax_buy = False
+
+        # Top Climax Exhaustion Rejection (Upper wick >= 32% at OLS Upper Band or VAH or 2-Sigma)
+        if (current_price >= ols["upper"] - 1.50 or current_price >= vp.get("vah", 9999.0) - 1.50 or z >= 1.50) and u_wick >= 0.32:
+            score -= 40.0
+            top_climax_sell = True
             confluence_reasons.append(f"TOP_CLIMAX_EXHAUSTION_REVERSAL_SELL (Upper Wick {u_wick*100:.1f}%, z={z:.2f})")
 
-        # Bottom Climax Exhaustion Absorption (Lower wick >= 35% at OLS Lower Band or VAL)
-        if (current_price <= ols["lower"] + 1.50 or current_price <= vp.get("val", 0.0) + 1.50 or z <= -1.65) and l_wick >= 0.35:
-            score += 30.0
+        # Bottom Climax Exhaustion Absorption (Lower wick >= 32% at OLS Lower Band or VAL or 2-Sigma)
+        if (current_price <= ols["lower"] + 1.50 or current_price <= vp.get("val", 0.0) + 1.50 or z <= -1.50) and l_wick >= 0.32:
+            score += 40.0
+            bottom_climax_buy = True
             confluence_reasons.append(f"BOTTOM_CLIMAX_EXHAUSTION_REVERSAL_BUY (Lower Wick {l_wick*100:.1f}%, z={z:.2f})")
 
         # D.2 Anti-Climax Chasing Vetoes (Never Buy the top wick or Sell the bottom plunge)
@@ -1124,6 +1129,8 @@ class TradingViewConfluenceMatrix:
             "score": round(score, 1),
             "direction": direction,
             "estimated_win_rate": est_win_rate,
+            "top_climax_sell": top_climax_sell,
+            "bottom_climax_buy": bottom_climax_buy,
             "reasons": confluence_reasons,
             "ols_channel": {
                 "center": round(ols["center"], 2),

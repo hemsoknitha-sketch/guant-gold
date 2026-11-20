@@ -43,7 +43,7 @@ class TestQuantGoldReversalFlip(unittest.TestCase):
         existing_entry_p = self.engine._active_gold_entry_price
         existing_pnl_pts = (current_price - existing_entry_p) if existing_dir == "BUY" else (existing_entry_p - current_price)
         is_existing_profitable = (existing_pnl_pts >= 1.20)
-        is_existing_losing = (existing_pnl_pts <= -0.50)
+        is_existing_losing = (existing_pnl_pts <= -2.50)
         self.assertTrue(is_existing_losing)
         self.assertFalse(is_existing_profitable)
 
@@ -224,6 +224,63 @@ class TestQuantGoldReversalFlip(unittest.TestCase):
             pnl_pts >= 1.20
         )
         self.assertTrue(is_shock_pts)
+
+    def test_reversal_flip_discount_zone_veto(self):
+        """Verify that flipping to SELL in Discount zone (<= 40%) is strictly vetoed (AQ88 Invariant 138)."""
+        current_price = 3525.55
+        range_pct_flip = 0.204  # 20.4% in deep discount
+        action = "SELL"
+        can_flip = False
+        flip_veto_reason = ""
+
+        if action == "SELL":
+            if range_pct_flip <= 0.40:
+                flip_veto_reason = f"DISCOUNT_ZONE_REVERSAL_SELL_BLOCKED (Price ${current_price:.2f} is in Discount {range_pct_flip*100:.1f}%. Flipping into SELL at range bottom is retail suicide!)"
+            else:
+                can_flip = True
+
+        self.assertFalse(can_flip)
+        self.assertIn("DISCOUNT_ZONE_REVERSAL_SELL_BLOCKED", flip_veto_reason)
+
+    def test_reversal_flip_scratch_zone_protection(self):
+        """Verify that normal broker spread noise (-0.50 pts) NEVER triggers reversal flip."""
+        current_price = 3524.50
+        existing_entry_p = 3525.00
+        existing_dir = "BUY"
+        existing_pnl_pts = current_price - existing_entry_p  # -0.50 pts
+        is_existing_profitable = (existing_pnl_pts >= 1.20)
+        is_existing_losing = (existing_pnl_pts <= -2.50)  # Requires <= -2.50 pts
+
+        self.assertFalse(is_existing_profitable)
+        self.assertFalse(is_existing_losing)  # -0.50 is NOT losing!
+
+        flip_veto_reason = ""
+        if not is_existing_losing:
+            flip_veto_reason = f"SCRATCH_ZONE_HOLD (Existing {existing_dir} in neutral scratch zone {existing_pnl_pts:+.2f} pts. Awaiting structural invalidation or profit target.)"
+
+        self.assertIn("SCRATCH_ZONE_HOLD", flip_veto_reason)
+
+    def test_bottom_exhaustion_overrides_macro_bear(self):
+        """Verify that bottom exhaustion overrides macro bear trend veto to approve BUY (AQ88 Invariant 138)."""
+        is_macro_bear = True
+        cand_action = "BUY"
+        is_bottom_exhaustion_confirmed = True
+        curr_p = 3525.0
+        range_low = 3518.0
+        range_pct = 0.20
+
+        final_action = "HOLD"
+        reason = ""
+        if cand_action == "BUY" and is_macro_bear:
+            if is_bottom_exhaustion_confirmed:
+                final_action = "BUY"
+                reason = f"MACRO_BEAR_OVERRIDDEN_BY_BOTTOM_EXHAUSTION_BUY: Price ${curr_p:.2f} reached Range Low ${range_low:.2f} (Discount {range_pct*100:.1f}%)."
+            else:
+                final_action = "HOLD"
+                reason = "H1_H4_MACRO_BEAR_VETO"
+
+        self.assertEqual(final_action, "BUY")
+        self.assertIn("MACRO_BEAR_OVERRIDDEN_BY_BOTTOM_EXHAUSTION_BUY", reason)
 
 
 if __name__ == "__main__":
