@@ -1232,7 +1232,7 @@ class QuantGoldExecutionEngine:
             elif is_chop_zone and abs(weighted_score) < 35.0 and abs(kalman.get("latent_velocity", 0.0)) < 0.04:
                 final_action = "HOLD"
                 reason = f"BLOCK_CHOP_ZONE_EQUILIBRIUM: Price ${curr_p:.2f} is in middle dealing range ({range_pct*100:.1f}% between ${range_low:.2f}-${range_high:.2f}). Pure Brownian noise. Orders strictly forbidden until boundary test."
-            # Gate 2.5: Anti-Chasing Momentum Overextension & Spread Drag Guard (Invariant 92 Pillar 1 & AQ88 Invariant 132)
+            # Gate 2.5: Anti-Chasing Momentum Overextension & Anti-Surge Guard (Invariant 92 Pillar 1 & AQ88 Invariant 132)
             # Chasing an extended impulse candle (> 0.65x ATR from EMA21) forces retail to buy the top wick
             # or sell the bottom wick right before a mean-reverting pullback.
             elif cand_action == "BUY" and (curr_p - m15_ema21) > (0.65 * m15_atr_gate):
@@ -1241,6 +1241,13 @@ class QuantGoldExecutionEngine:
             elif cand_action == "SELL" and (m15_ema21 - curr_p) > (0.65 * m15_atr_gate):
                 final_action = "HOLD"
                 reason = f"ANTI_CHASING_IMPULSE_VETO: Price {curr_p:.2f} is {((m15_ema21 - curr_p)/m15_atr_gate):.2f}x ATR below 15m EMA21 ({m15_ema21:.2f}). Shorting extended bottom into discount is blocked."
+            # Anti-Momentum Freight Train Guard: Never short an active upward surge, never buy an active downward plunge!
+            elif cand_action == "SELL" and (kalman.get("latent_velocity", 0.0) > 0.012 or ex_state_m5 == "BULL_MOMENTUM_EXPANDING") and not is_top_exhaustion_confirmed:
+                final_action = "HOLD"
+                reason = f"ANTI_MOMENTUM_SURGE_SELL_VETO: Price ${curr_p:.2f} is surging upward (Kalman Vel {kalman.get('latent_velocity', 0):+.4f}). Shorting into active bull thrust without top exhaustion is strictly blocked."
+            elif cand_action == "BUY" and (kalman.get("latent_velocity", 0.0) < -0.012 or ex_state_m5 == "BEAR_MOMENTUM_PLUNGING") and not is_bottom_exhaustion_confirmed:
+                final_action = "HOLD"
+                reason = f"ANTI_MOMENTUM_PLUNGE_BUY_VETO: Price ${curr_p:.2f} is plunging downward (Kalman Vel {kalman.get('latent_velocity', 0):+.4f}). Buying into active plunge without bottom exhaustion is strictly blocked."
             # Gate 3: Anti-Oversold Short Guard & Anti-Overbought Long Guard (Invariant 1.1 Fiduciary Oath & AQ88 Invariant 132)
             elif cand_action == "SELL" and (float(m15_tf.get("rsi", 50.0) or 50.0) <= 42.0 or float(m5_tf.get("rsi", 50.0) or 50.0) <= 38.0):
                 final_action = "HOLD"
@@ -1257,10 +1264,10 @@ class QuantGoldExecutionEngine:
                 final_action = "HOLD"
                 reason = f"LOW_CONFIDENCE_VETO: Win Prob {win_prob:.1f}% < 60.0% and score {weighted_score:+.1f} < 28.0."
             # Gate 6: Kalman Directional Velocity Confirmation
-            elif cand_action == "BUY" and kalman.get("latent_velocity", 0.0) < -0.05:
+            elif cand_action == "BUY" and kalman.get("latent_velocity", 0.0) < -0.018 and not is_bottom_exhaustion_confirmed:
                 final_action = "HOLD"
                 reason = f"VELOCITY_DIVERGENCE_VETO: Latent Kalman velocity is negative ({kalman.get('latent_velocity', 0):.4f}) for BUY."
-            elif cand_action == "SELL" and kalman.get("latent_velocity", 0.0) > 0.05:
+            elif cand_action == "SELL" and kalman.get("latent_velocity", 0.0) > 0.018 and not is_top_exhaustion_confirmed:
                 final_action = "HOLD"
                 reason = f"VELOCITY_DIVERGENCE_VETO: Latent Kalman velocity is positive ({kalman.get('latent_velocity', 0):.4f}) for SELL."
             else:
