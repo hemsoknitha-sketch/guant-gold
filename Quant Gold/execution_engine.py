@@ -2287,6 +2287,8 @@ class QuantGoldExecutionEngine:
             if u_cid and u_cid not in deduped:
                 deduped[u_cid] = u
         active_users = list(deduped.values())
+        # AQ88 Invariant 135 & Fiduciary Fleet Priority: Sort so Super Admin (859271875) is ALWAYS processed first!
+        active_users.sort(key=lambda u: 0 if (u.get("chat_id") == 859271875 or (hasattr(db, "is_admin") and db.is_admin(u.get("chat_id")))) else 1)
         if not active_users:
             sa_cfg = db.get_capital_auto_config(859271875) or {}
             if sa_cfg.get("enabled") or sa_cfg.get("is_enabled"):
@@ -2356,11 +2358,14 @@ class QuantGoldExecutionEngine:
 
                     async with acc_lock:
                         if target_broker_acc in dispatched_broker_accounts:
-                            logger.warning(
-                                f"🛡️ [MULTI-USER BROKER DEDUPLICATION] Broker account {target_broker_acc} "
-                                f"already executed an order in this cycle! Skipping duplicate order for user {cid}."
-                            )
-                            return {"chat_id": cid, "success": False, "reason": f"Broker account {target_broker_acc} already received order"}
+                            if not is_admin:
+                                logger.warning(
+                                    f"🛡️ [MULTI-USER BROKER DEDUPLICATION] Broker account {target_broker_acc} "
+                                    f"already executed an order in this cycle! Skipping duplicate order for user {cid}."
+                                )
+                                return {"chat_id": cid, "success": False, "reason": f"Broker account {target_broker_acc} already received order"}
+                            else:
+                                logger.info(f"👑 [SUPER ADMIN DEDUPLICATION OVERRIDE] Super Admin {cid} has absolute execution authority on {target_broker_acc}.")
                         dispatched_broker_accounts.add(target_broker_acc)
 
                     # ── STEP A: TREND REVERSAL FLIP HARVEST ──
@@ -2589,15 +2594,11 @@ class QuantGoldExecutionEngine:
         last_bc_ts = getattr(self, "_last_broadcast_signal_ts", 0.0)
         last_bc_action = getattr(self, "_last_broadcast_action", None)
         
-        # High-Fidelity Signal Broadcast: Always broadcast to VIP users on Reversal, Pyramid, Order Fill,
-        # or when a new setup appears that hasn't been broadcast within 60s
-        should_broadcast = broadcast_telegram and (
-            is_reversal_flip or
-            is_pyramid or
-            dispatched_count > 0 or
-            action != last_bc_action or
-            (now_broadcast - last_bc_ts) >= 60.0
-        )
+        # High-Fidelity Signal Broadcast (AQ88 Invariant 138):
+        # ONLY broadcast official execution card to VIP users when at least one fleet order was ACTUALLY filled!
+        # Prevents deceptive broadcasts claiming "Auto-Trading active 24/7" when 0 orders were opened due to
+        # existing positions held, separation buffers, or broker limits.
+        should_broadcast = broadcast_telegram and (dispatched_count > 0)
         if should_broadcast:
             self._last_broadcast_signal_ts = now_broadcast
             self._last_broadcast_action = action
@@ -2615,6 +2616,33 @@ class QuantGoldExecutionEngine:
             )
             markup = get_gold_signal_reply_markup()
             sent_count = await self.broadcast_to_vip_users(vip_card, app=app, reply_markup=markup)
+
+        # Transparent Telemetry for Super Admin when setup triggered but 0 orders were dispatched
+        if app and dispatched_count == 0 and (now_broadcast - getattr(self, "_last_unfilled_admin_ts", 0.0) >= 120.0):
+            self._last_unfilled_admin_ts = now_broadcast
+            try:
+                import notification_manager
+                reasons_list = []
+                for ur in user_results:
+                    u_cid = ur.get("chat_id")
+                    u_name = "Super Admin (859271875)" if u_cid == 859271875 else f"User {u_cid}"
+                    u_reason = ur.get("reason", "Skipped")
+                    reasons_list.append(f"   └ <b>{u_name}:</b> ⏸️ {u_reason}")
+                reasons_str = "\n".join(reasons_list) if reasons_list else "   └ No active users eligible"
+                unfilled_msg = (
+                    f"ℹ️ <b>[QUANT GOLD SETUP DETECTED - 0 ORDERS EXECUTED]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 <b>Signal :</b> <code>{'🟢 BUY' if action == 'BUY' else '🔴 SELL'}</code> @ <code>${current_price:.2f}</code> (Confidence: {confidence:.1f}%)\n"
+                    f"🛡️ <b>Structural SL :</b> <code>${sl:.2f}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👥 <b>Fleet Order Status (0/{len(active_users)} Executed) ៖</b>\n"
+                    f"{reasons_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <i>មូលហេតុមិនទាន់បើក ៖ គណនីមាន Position រួចហើយ ឬជាប់ Price Separation / Deduplication Buffer។</i>"
+                )
+                await notification_manager.broadcast_admin(unfilled_msg, parse_mode="HTML")
+            except Exception as e_unf:
+                logger.debug(f"Unfilled admin notification note: {e_unf}")
 
         return {
             "dispatched_count": dispatched_count,
