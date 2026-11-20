@@ -1949,7 +1949,7 @@ class QuantGoldExecutionEngine:
 
                         # Dynamic anti-whipsaw cooldown: 180s (3 minutes) to prevent chop churn
                         rev_cooldown_left = 180.0 - (now_ts - last_rev_ts)
-                        min_hold_req = 45.0
+                        min_hold_req = 15.0
 
                         first_pos_ts = 0.0
                         if active_gold_trades:
@@ -1980,12 +1980,8 @@ class QuantGoldExecutionEngine:
                         can_flip = False
                         flip_veto_reason = ""
 
-                        # 1. FIDUCIARY PROFIT PROTECTION: Never flip an existing healthy/winning trade!
-                        if is_existing_profitable:
-                            flip_veto_reason = f"PROFIT_RUNNER_PROTECTED (Existing {existing_dir} in solid profit with {existing_pnl_pts:+.2f} pts PnL. Protected by TP/SL, flipping forbidden!)"
-                        elif not is_existing_losing:
-                            flip_veto_reason = f"SCRATCH_ZONE_HOLD (Existing {existing_dir} in neutral scratch zone {existing_pnl_pts:+.2f} pts. Awaiting structural invalidation or profit target.)"
-                        elif rev_cooldown_left > 0:
+                        # 1. TIMING & ANTI-WHIPSAW PROTECTION
+                        if rev_cooldown_left > 0:
                             flip_veto_reason = f"COOLDOWN_ACTIVE ({rev_cooldown_left:.0f}s left of 180s)"
                         elif time_in_pos < min_hold_req:
                             flip_veto_reason = f"MIN_HOLD_PROTECTION (in position {time_in_pos:.0f}s < {min_hold_req:.0f}s)"
@@ -2007,7 +2003,18 @@ class QuantGoldExecutionEngine:
                             elif ex_state == "BULLS_EXHAUSTED_AT_TOP":
                                 flip_veto_reason = "EXHAUSTION_VETO (Bulls exhausted at top with rejection wick)"
                             else:
-                                can_flip = True
+                                # Reversal BUY signal is structurally and mathematically confirmed
+                                is_valley_exhaustion = (ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" or bool(tv_matrix_flip.get("bottom_climax_buy", False)) or range_pct_flip <= 0.35)
+                                if is_existing_profitable:
+                                    can_flip = True
+                                    logger.info(
+                                        f"🎉 [VALLEY PROFIT HARVEST & FLIP] Existing {existing_dir} profit ({existing_pnl_pts:+.2f} pts) "
+                                        f"harvested at support bottom! Engaging Reversal Flip to BUY!"
+                                    )
+                                elif is_existing_losing or is_valley_exhaustion or confidence >= 78.0:
+                                    can_flip = True
+                                else:
+                                    flip_veto_reason = f"SCRATCH_ZONE_HOLD (Existing {existing_dir} in neutral scratch zone {existing_pnl_pts:+.2f} pts. Awaiting supreme conviction or profit target.)"
                         elif action == "SELL":
                             if range_pct_flip <= 0.40:
                                 flip_veto_reason = f"DISCOUNT_ZONE_REVERSAL_SELL_BLOCKED (Price ${current_price:.2f} is in Discount {range_pct_flip*100:.1f}%. Flipping into SELL at range bottom is retail suicide!)"
@@ -2026,7 +2033,18 @@ class QuantGoldExecutionEngine:
                             elif ex_state == "BEARS_EXHAUSTED_AT_BOTTOM":
                                 flip_veto_reason = "EXHAUSTION_VETO (Bears exhausted at bottom with rejection wick)"
                             else:
-                                can_flip = True
+                                # Reversal SELL signal is structurally and mathematically confirmed
+                                is_peak_exhaustion = (ex_state == "BULLS_EXHAUSTED_AT_TOP" or bool(tv_matrix_flip.get("top_climax_sell", False)) or range_pct_flip >= 0.65)
+                                if is_existing_profitable:
+                                    can_flip = True
+                                    logger.info(
+                                        f"🎉 [PEAK PROFIT HARVEST & FLIP] Existing {existing_dir} profit ({existing_pnl_pts:+.2f} pts) "
+                                        f"harvested at peak top! Engaging Reversal Flip to SELL!"
+                                    )
+                                elif is_existing_losing or is_peak_exhaustion or confidence >= 78.0:
+                                    can_flip = True
+                                else:
+                                    flip_veto_reason = f"SCRATCH_ZONE_HOLD (Existing {existing_dir} in neutral scratch zone {existing_pnl_pts:+.2f} pts. Awaiting supreme conviction or profit target.)"
 
                         if can_flip:
                             is_reversal_flip = True
@@ -3494,13 +3512,13 @@ class QuantGoldExecutionEngine:
                 # ── MACHINE 1: M5 SCALP FAST HARVESTER (M15 CONFLUENCE) ──
                 # Target: +$5.00 to +$10.00 (+100 pips / +10 pts) per trade.
                 # Armor: When profit reaches >= +$3.50 (+7.0 pts / +70 pips), shift SL to Breakeven Armor (Entry ± Spread Floor)!
-                if is_e1 and not is_manual_trade:
-                    # STEP 1: BREAKEVEN ARMOR PROTECTION AT >= +$3.50 (+7.0 pts / +70 pips)
-                    # Provides healthy breathing distance (>= 3.50 pts) so normal 1-2 pt spread noise CANNOT clip it!
-                    is_dollar_armor_hit = (upl >= 3.50 or pnl_pts >= 7.00)
+                if is_e1:
+                    # STEP 1: BREAKEVEN ARMOR PROTECTION AT >= +$1.25 / +2.50 pts (+25 pips)
+                    # Locks trade at Entry ± Spread Floor (0.00R Free Roll), so a winning trade CANNOT turn into a loss!
+                    is_dollar_armor_hit = (upl >= 1.25 or pnl_pts >= 2.50)
                     if is_dollar_armor_hit and scale_tier < 1 and deal_id not in self._be_armor_locked_deals:
-                        be_buffer = max(1.00, spread * 2.0)
-                        min_breathing_buf = max(3.50, spread * 4.0)
+                        be_buffer = max(0.50, spread * 1.2)
+                        min_breathing_buf = max(1.20, spread * 2.4)
                         if dir_side == "BUY":
                             raw_be = entry_p + be_buffer
                             be_level = min(raw_be, curr_p - min_breathing_buf)
@@ -3510,8 +3528,8 @@ class QuantGoldExecutionEngine:
 
                         if abs(sl - be_level) > 0.20:
                             logger.info(
-                                f"🛡️ [SUPER SMART BREAKEVEN ARMOR] Machine 1 Scalp profit +${upl:.2f} reached +$3.50 milestone (+{pips} pips / {pnl_pts:.2f} pts). "
-                                f"Shifted SL to {be_level:.2f} (Entry ± Spread Floor, 0.00R Free Roll)! Trade is 100% loss-immune with 3.5+ pts breathing room!"
+                                f"🛡️ [SUPER SMART BREAKEVEN ARMOR] Scalp profit +${upl:.2f} reached +25 pips milestone (+{pips} pips / {pnl_pts:.2f} pts). "
+                                f"Shifted SL to {be_level:.2f} (Entry ± Spread Floor, 0.00R Free Roll)! Trade is 100% loss-immune with breathing room!"
                             )
                             try:
                                 if cid:
