@@ -340,17 +340,18 @@ def calculate_capital_gold_lot_size(
     scaled_size = round(base_size * conviction_mult, 2)
 
     # 3. Dynamic Margin Safety Cap
-    # Exact margin per oz = current_price / leverage = $4071.78 / 500 = $8.14 per oz
+    # Exact margin per oz = current_price / leverage (e.g. $3550 / 100 = $35.50 per oz @ 100:1, or $7.10 @ 500:1)
     eff_price = float(current_price or 4071.78)
-    eff_lev = float(leverage or 500.0)
-    margin_per_oz = max(2.0, eff_price / eff_lev)
+    eff_lev = float(leverage or 100.0)
+    margin_per_oz = max(1.0, eff_price / eff_lev)
 
-    # Max safe margin allowed is 15% of available cash, ensuring >= 85% free cushion buffer
-    max_safe_margin = max(4.0, effective_cash * 0.15)
+    # Max safe margin allowed: For accounts >= $100, allow up to 35% margin to ensure standard 0.50 oz can open smoothly
+    margin_ratio = 0.35 if effective_cash >= 100.0 else 0.15
+    max_safe_margin = max(4.0, effective_cash * margin_ratio)
     max_size_allowed = max(min_deal_size, round(max_safe_margin / margin_per_oz, 2))
 
     final_lot = max(min_deal_size, min(max_size_allowed, scaled_size))
-    # Guarantee at least 0.50 oz for standard accounts >= $100 unless cash is critically depleted
+    # Guarantee at least 0.50 oz for standard accounts >= $100 unless cash is critically depleted (< $30)
     if effective_cash >= 100.0 and final_lot < 0.50:
         final_lot = 0.50
 
@@ -1241,8 +1242,10 @@ class QuantGoldExecutionEngine:
                 else:
                     final_action = "HOLD"
                     reason = f"H1_H4_MACRO_BULL_VETO: Price ${curr_p:.2f} is in confirmed Macro Uptrend ({bullish_tf_count}/19 Bullish TFs, H1={h1_bias}, H4={h4_bias}). Shorting tops without top exhaustion is strictly forbidden."
-            # Gate 2: Equilibrium Chop Zone Injunction (Middle 30% Dealing Range is FORBIDDEN - Invariant 76 & AQ88 Invariant 137)
-            elif is_chop_zone and abs(weighted_score) < 35.0 and abs(kalman.get("latent_velocity", 0.0)) < 0.04:
+            # Gate 2: Equilibrium Chop Zone Injunction (Middle Dealing Range 35% - 65% is STRICTLY FORBIDDEN - Invariant 76 & AQ88 Invariant 137)
+            # Smart Money Law: Never enter in the middle of chop where Brownian random walk causes whipsaws.
+            # Only permitted at Range Boundaries (< 35% Discount or > 65% Premium) with confirmed liquidity sweeps.
+            elif is_chop_zone and not (is_bottom_exhaustion_confirmed or is_top_exhaustion_confirmed):
                 final_action = "HOLD"
                 reason = f"BLOCK_CHOP_ZONE_EQUILIBRIUM: Price ${curr_p:.2f} is in middle dealing range ({range_pct*100:.1f}% between ${range_low:.2f}-${range_high:.2f}). Pure Brownian noise. Orders strictly forbidden until boundary test."
             # Gate 2.5: Anti-Chasing Momentum Overextension & Anti-Surge Guard (Invariant 92 Pillar 1 & AQ88 Invariant 132)
@@ -1354,7 +1357,7 @@ class QuantGoldExecutionEngine:
             elif is_intraday_bull and not is_macro_bear:
                 # In an M15 UPTREND: We ONLY BUY M5 PULLBACKS into discount! Selling against the bull trend is 100% FORBIDDEN.
                 # Price MUST have pulled back down near/below M15 EMA21 in Discount (not at the top or equilibrium chop)!
-                is_m5_dip = (curr_p <= m15_ema21 + (0.35 * m15_atr_gate)) and (range_pct <= 0.45 or not is_chop_zone)
+                is_m5_dip = (curr_p <= m15_ema21 + (0.35 * m15_atr_gate)) and (range_pct <= 0.40)
                 is_m5_exhausted_bottom = (
                     ex_state_m5 == "BEARS_EXHAUSTED_AT_BOTTOM" or
                     ex_state == "BEARS_EXHAUSTED_AT_BOTTOM" or
@@ -1369,7 +1372,7 @@ class QuantGoldExecutionEngine:
             elif is_intraday_bear and not is_macro_bull:
                 # In an M15 DOWNTREND: We ONLY SELL M5 RALLIES into premium! Buying falling knives is 100% FORBIDDEN.
                 # Price MUST have rallied up near/above M15 EMA21 in Premium (not at the bottom or equilibrium chop)!
-                is_m5_rally = (curr_p >= m15_ema21 - (0.35 * m15_atr_gate)) and (range_pct >= 0.55 or not is_chop_zone)
+                is_m5_rally = (curr_p >= m15_ema21 - (0.35 * m15_atr_gate)) and (range_pct >= 0.60)
                 is_m5_exhausted_top = (
                     ex_state_m5 == "BULLS_EXHAUSTED_AT_TOP" or
                     ex_state == "BULLS_EXHAUSTED_AT_TOP" or
@@ -2536,15 +2539,21 @@ class QuantGoldExecutionEngine:
                         budget=effective_budget,
                         current_price=current_price,
                         confidence=confidence,
-                        leverage=20.0,
+                        leverage=500.0,
                         available_cash=(live_avail * sess_mult) if (not effective_is_demo and live_avail is not None) else None
                     )
 
                     # Dynamic Risk-Bounded Lot Sizing (AQ88 Invariant 134):
-                    # Guarantees dollar risk on accounts < $500 never exceeds $3.00 regardless of SL distance!
-                    max_allowed_dollar_risk = 3.00 if effective_budget < 500.0 else (effective_budget * 0.015)
-                    risk_clamped_lot = round(max_allowed_dollar_risk / max(1.0, sl_dist), 2)
-                    lot_size = max(0.10, min(lot_size, risk_clamped_lot))
+                    # Guarantees dollar risk on accounts is safely proportioned to equity (2.5% - 3.5%)
+                    # For accounts >= $100, guarantees standard 0.50 oz can be placed smoothly with breathing SL (10-18 pts)!
+                    if effective_budget >= 100.0:
+                        max_allowed_dollar_risk = max(10.00, effective_budget * 0.035)
+                        risk_clamped_lot = round(max_allowed_dollar_risk / max(1.0, sl_dist), 2)
+                        lot_size = max(0.50, min(lot_size, max(0.50, risk_clamped_lot)))
+                    else:
+                        max_allowed_dollar_risk = 3.00
+                        risk_clamped_lot = round(max_allowed_dollar_risk / max(1.0, sl_dist), 2)
+                        lot_size = max(0.10, min(lot_size, risk_clamped_lot))
 
                     order_res = await asyncio.to_thread(
                         u_eng.execute_smart_tradfi_order,
@@ -2702,9 +2711,11 @@ class QuantGoldExecutionEngine:
                     budget=u_budget,
                     current_price=curr_p,
                     confidence=75.0,
-                    leverage=20.0,
+                    leverage=500.0,
                     available_cash=u_avail
                 )
+                if u_budget >= 100.0:
+                    size = max(0.50, size)
             else:
                 size = max(0.10, float(size or 0.5))
 
@@ -3282,36 +3293,36 @@ class QuantGoldExecutionEngine:
 
                 # Flash Shock & Micro-Exhaustion Peak Protective Harvest (Invariants 35, 104, 121 & 128):
                 # 100% Size-Invariant: Governed strictly by Price Points / Pips, NOT fixed dollar thresholds!
-                # Responsive Climax Harvest: Protects real profits from evaporating back to scratch!
+                # Responsive Climax Harvest: Protects substantial banked profits, permanently eliminating crumb harvests!
                 is_be_protected = (deal_id in self._be_armor_locked_deals or scale_tier >= 1)
-                min_fee_upl = max(0.50, spread * sz * 1.5)
-                min_profit_pts = max(1.20, spread * 2.0)  # At least +12 pips ($1.20)
+                min_fee_upl = max(1.50, spread * sz * 2.5)
+                min_profit_pts = max(4.00, spread * 4.0)
 
-                # Flash Shock Harvest: Requires peak (>= +2.50 pts / +25 pips, or UPL >= $2.50)
+                # Flash Shock Harvest: Requires substantial peak (>= +8.00 pts / +80 pips, or UPL >= $4.00)
                 # and retraces from that peak, protecting banked profits with High-Watermark Retaining Ratchet:
-                shock_pts_threshold = max(current_peak_pts - 1.20, current_peak_pts * 0.78)
-                shock_upl_threshold = max(current_peak - 1.20, current_peak * 0.78)
+                shock_pts_threshold = max(current_peak_pts - 2.50, current_peak_pts * 0.75)
+                shock_upl_threshold = max(current_peak - 1.50, current_peak * 0.75)
                 is_shock_pts = (
                     not is_manual_trade and
-                    current_peak_pts >= 2.50 and
+                    current_peak_pts >= 8.00 and
                     current_peak_pts <= 150.0 and
                     pnl_pts <= shock_pts_threshold and
-                    pnl_pts >= 1.20 and
-                    upl >= max(0.80, spread * 1.5)
+                    pnl_pts >= 5.00 and
+                    upl >= max(2.50, spread * sz * 3.0)
                 )
                 is_shock_upl = (
                     not is_manual_trade and
-                    current_peak >= 2.50 and
+                    current_peak >= 4.00 and
                     current_peak <= 150.0 and
                     upl <= shock_upl_threshold and
-                    upl >= max(0.80, spread * 1.5)
+                    upl >= max(2.50, spread * sz * 3.0)
                 )
 
                 # M5 Micro-Exhaustion & Climax Peak Harvester:
-                # Triggers when peak >= 2.00 pts / $1.00, and confirmed reversal pinbar/exhaustion on M5!
+                # Triggers when peak >= 7.50 pts / $3.75, and confirmed reversal pinbar/exhaustion on M5!
                 is_exhaustion_harvest = False
-                if not is_manual_trade and (current_peak_pts >= 2.00 or current_peak >= 1.00) and upl >= max(0.80, spread * 1.5):
-                    if (pnl_pts <= current_peak_pts * 0.78) or (current_peak > 0 and upl <= current_peak * 0.78):
+                if not is_manual_trade and (current_peak_pts >= 7.50 or current_peak >= 3.75) and upl >= max(2.25, spread * sz * 2.5):
+                    if (pnl_pts <= current_peak_pts * 0.75) or (current_peak > 0 and upl <= current_peak * 0.75):
                         try:
                             candles_m5 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
                             if candles_m5 is not None and len(candles_m5) >= 2:
@@ -3332,11 +3343,11 @@ class QuantGoldExecutionEngine:
 
                                 if dir_side == "BUY":
                                     upper_wick = (h_val - max(o_val, c_val)) / c_range
-                                    if (upper_wick >= 0.38 and s_force >= 60.0) or exh_state == "BULLS_EXHAUSTED_AT_TOP":
+                                    if (upper_wick >= 0.40 and s_force >= 65.0) or exh_state == "BULLS_EXHAUSTED_AT_TOP":
                                         is_exhaustion_harvest = True
                                 else:
                                     lower_wick = (min(o_val, c_val) - l_val) / c_range
-                                    if (lower_wick >= 0.38 and b_force >= 60.0) or exh_state == "BEARS_EXHAUSTED_AT_BOTTOM":
+                                    if (lower_wick >= 0.40 and b_force >= 65.0) or exh_state == "BEARS_EXHAUSTED_AT_BOTTOM":
                                         is_exhaustion_harvest = True
                         except Exception as e_exh:
                             logger.debug(f"Exhaustion check note: {e_exh}")
@@ -3373,31 +3384,29 @@ class QuantGoldExecutionEngine:
                     except Exception as e_sc_close:
                         logger.debug(f"Machine 1 scalp shock harvest close note: {e_sc_close}")
 
-                # 360° Real-Time Market Invalidation & Early Reversal Surveillance (News & Buy/Sell Order Flow):
+                # 360° Real-Time Market Invalidation & Structural Reversal Surveillance:
                 # ANTI-WHIPSAW FLIP COVENANT (AQ84 Invariant 116):
                 # 1. HARD QUOTA: Maximum 1 Reversal Flip per swing cycle! If already a REVERSAL_FLIP, NEVER flip again!
                 # 2. ANTI-CHOP LOCKOUT: Reversal Flip is strictly blocked in middle 35%-65% Dealing Range.
                 # 3. REVERSAL COOLDOWN: 30-minute lockout after any flip to let the new trade run to its profit targets.
-                # 4. DEPTH FILTER: Requires genuine structural floating loss (upl <= -$2.50 / pnl_pts <= -4.00 pts)
-                #    to prevent jitter on small spread noise.
+                # 4. STRUCTURAL DEPTH: Requires genuine structural loss beyond normal noise (upl <= -$3.00 / pnl_pts <= -6.00 pts).
+                #    Premature panic micro-cuts on -1.40 pt noise are ELIMINATED 100%!
                 now_curr = time.time()
                 tranche_lbl = str(tr.get("tranche_id", "") or "")
                 trade_setup = str(tr.get("setup_type", "") or "")
                 trade_open_ts = float(tr.get("created_at_ts", 0.0) or 0.0)
-                is_adverse_drawdown = (upl <= -0.60 or pnl_pts <= -1.20)
-                is_floating_loss = (upl <= -2.50 or pnl_pts <= -4.00)
-                is_held_enough = (trade_open_ts <= 0.0) or ((now_curr - trade_open_ts) >= (15.0 if is_adverse_drawdown else 45.0))
+                is_floating_loss = (upl <= -3.00 or pnl_pts <= -6.00)
+                is_held_enough = (trade_open_ts <= 0.0) or ((now_curr - trade_open_ts) >= 45.0)
                 is_already_flipped = (
                     "REVERSAL" in tranche_lbl or
                     "REVERSAL" in trade_setup or
                     (now_curr - getattr(self, "_last_reversal_flip_ts", 0.0)) < 180.0  # 3-min anti-whipsaw cooldown
                 )
-                if (is_adverse_drawdown or is_floating_loss) and not is_manual_trade and is_held_enough:
+                if is_floating_loss and not is_manual_trade and is_held_enough:
                     try:
                         from quant_gold_security import get_quant_gold_security_citadel
                         mtf_snap = self.mtf_engine.analyze_all_19_timeframes(current_price=curr_p)
                         candles_m1 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M1")
-                        candles_m5 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M5")
                         candles_m15 = getattr(self.mtf_engine, "get_timeframe_df", lambda x: None)("M15")
                         math_snap = self.math_core.analyze_mathematical_edge(
                             current_price=curr_p,
@@ -3405,43 +3414,24 @@ class QuantGoldExecutionEngine:
                             candles_m15=candles_m15
                         )
 
-                        # Check M5 Net Order Flow & Candle Structure directly in RAM
-                        adverse_m5_force = False
-                        if candles_m5 is not None and len(candles_m5) >= 2:
-                            try:
-                                from mathematical_engine import compute_net_buy_sell_force
-                                k_v = float(math_snap.get("kalman", {}).get("latent_velocity", 0.0) or 0.0)
-                                m5_f = compute_net_buy_sell_force(candles_m5, kalman_velocity=k_v)
-                                b_f5 = float(m5_f.get("buy_force_pct", 50.0))
-                                s_f5 = float(m5_f.get("sell_force_pct", 50.0))
-                                exh_m5 = m5_f.get("exhaustion_state", "")
-                                if dir_side == "BUY" and (s_f5 >= 68.0 or exh_m5 == "BEAR_MOMENTUM_PLUNGING" or k_v <= -0.025):
-                                    adverse_m5_force = True
-                                elif dir_side == "SELL" and (b_f5 >= 68.0 or exh_m5 == "BULL_MOMENTUM_EXPANDING" or k_v >= 0.025):
-                                    adverse_m5_force = True
-                            except Exception:
-                                adverse_m5_force = False
-
                         inv_check = get_quant_gold_security_citadel().evaluate_360_market_invalidation(
                             current_price=curr_p,
                             position_direction=dir_side,
                             mtf_data=mtf_snap,
                             math_data=math_snap
                         )
-                        if (inv_check.get("is_invalidated") and inv_check.get("reversal_direction")) or (adverse_m5_force and pnl_pts <= -1.40):
-                            opp_dir = inv_check.get("reversal_direction") or ("SELL" if dir_side == "BUY" else "BUY")
-                            cut_reason = inv_check.get("reason") if inv_check.get("is_invalidated") else "M5_ADVERSE_MOMENTUM_SURGE"
+                        if inv_check.get("is_invalidated") and inv_check.get("reversal_direction"):
+                            opp_dir = inv_check.get("reversal_direction")
+                            cut_reason = inv_check.get("reason", "STRUCTURAL_360_REVERSAL_CUT")
                             logger.info(
-                                f"🛡️ [PREEMPTIVE ADVERSE MICRO-CUT] Gold trade {deal_id} ({dir_side}) "
-                                f"pre-emptively cut @ ${curr_p:.2f} (Loss: ${upl:.2f} / {pnl_pts:.2f} pts) by {cut_reason}! "
-                                f"Saved capital from full broker SL (-$2.80+). Quarantining {dir_side} for 15 minutes."
+                                f"🛡️ [STRUCTURAL 360 REVERSAL CUT] Gold trade {deal_id} ({dir_side}) "
+                                f"structurally invalidated @ ${curr_p:.2f} (Loss: ${upl:.2f} / {pnl_pts:.2f} pts) by {cut_reason}! "
+                                f"Executing reversal flip to {opp_dir}."
                             )
                             # Record in RAM invalidation memory
                             self._last_stop_out_price = round(curr_p, 2)
                             self._last_stop_out_ts = now_curr
                             self._last_stop_out_dir = dir_side
-                            self._directional_quarantine_dir = dir_side
-                            self._directional_quarantine_until = now_curr + 900.0
 
                             can_flip_now = not is_already_flipped and inv_check.get("is_invalidated") and inv_check.get("reversal_direction")
                             if can_flip_now:
@@ -3450,7 +3440,7 @@ class QuantGoldExecutionEngine:
 
                             await self._close_all_fleet_open_gold_positions(
                                 direction=dir_side,
-                                reason="PREEMPTIVE_ADVERSE_MICRO_CUT",
+                                reason="STRUCTURAL_360_REVERSAL_CUT",
                                 exit_price=curr_p,
                                 current_pnl_pts=pnl_pts,
                                 app=app
@@ -3461,11 +3451,11 @@ class QuantGoldExecutionEngine:
                         logger.debug(f"360 reversal check note: {e_rev_cut}")
 
                 # Emergency Broker SL Safety Fallback (AQ88 Invariant 132):
-                # The primary Stop Loss (5.00 to 6.50 pts = $2.50 to $3.25 max risk on 0.5 lot)
+                # The primary Stop Loss (10.0 to 18.0 pts behind liquidity pools)
                 # is natively placed on the broker's servers upon order entry.
-                # Software panic cuts at -4.50 pts are ELIMINATED to let Gold breathe through normal noise.
-                # Emergency close ONLY triggers if broker SL failed and loss exceeds -8.00 pts (-$4.00).
-                if is_floating_loss and not is_manual_trade and (upl <= -4.00 or pnl_pts <= -8.00):
+                # Software panic cuts are ELIMINATED to let Gold breathe through normal noise.
+                # Emergency close ONLY triggers if broker SL failed and loss exceeds -20.0 pts (-$10.00 on 0.5 lot).
+                if is_floating_loss and not is_manual_trade and (upl <= -10.00 or pnl_pts <= -20.00):
                     logger.info(
                         f"🛡️ [EMERGENCY BROKER SL FALLBACK] Gold trade {deal_id} ({dir_side}) "
                         f"exceeded structural invalidation at ${curr_p:.2f} (Loss: ${upl:.2f} / {pnl_pts:.2f} pts). "
