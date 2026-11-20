@@ -1708,7 +1708,7 @@ class QuantGoldExecutionEngine:
                 self._last_hf_backup_ts = now_ts
                 try:
                     import backup_manager
-                    asyncio.create_task(asyncio.to_thread(backup_manager.perform_backup, False, True))
+                    asyncio.create_task(asyncio.to_thread(backup_manager.perform_backup, False))
                     logger.info("☁️ [CLOUD VAULT] Dispatched automated 24h Hugging Face database backup task.")
                 except Exception as e_bck:
                     logger.debug(f"Cloud backup dispatch note: {e_bck}")
@@ -2546,7 +2546,13 @@ class QuantGoldExecutionEngine:
                         single_compact=True
                     )
                     if order_res.get("success"):
-                        deal_id = order_res.get("deal_reference") or order_res.get("dealId", "OK")
+                        deal_id = order_res.get("dealId") or order_res.get("deal_id") or order_res.get("deal_reference", "OK")
+                        deal_ref = order_res.get("deal_reference") or str(deal_id)
+                        if str(deal_id).startswith("o_"):
+                            real_d = order_res.get("dealId") or order_res.get("deal_id")
+                            if real_d and not str(real_d).startswith("o_"):
+                                deal_id = real_d
+
                         self._active_gold_deal_id = str(deal_id)
                         self._active_gold_direction = action
                         self._active_gold_entry_price = current_price
@@ -2562,7 +2568,7 @@ class QuantGoldExecutionEngine:
                         db.record_capital_auto_trade(
                             chat_id=cid,
                             deal_id=str(deal_id),
-                            deal_reference=str(deal_id),
+                            deal_reference=str(deal_ref),
                             epic="GOLD",
                             direction=action,
                             size=lot_size,
@@ -3043,6 +3049,7 @@ class QuantGoldExecutionEngine:
             # Broker reconciliation: interrogate broker open positions per user & mode
             # Broker reconciliation: interrogate broker open positions per user & mode
             user_broker_open_deals: Dict[Tuple[int, bool], set] = {}
+            user_broker_ref_to_deal: Dict[Tuple[int, bool], Dict[str, str]] = {}
             successfully_audited_engs: set = set()
             try:
                 for tr in active_trades:
@@ -3058,13 +3065,19 @@ class QuantGoldExecutionEngine:
                             fetch_failed = getattr(u_eng, "_last_positions_fetch_failed", False)
                             if pos_list is not None and not fetch_failed:
                                 d_set = set()
+                                ref_map = {}
                                 for p_item in pos_list:
                                     pos = p_item.get("position", p_item)
                                     d_id = str(pos.get("dealId") or pos.get("deal_id") or "")
                                     epic = str(p_item.get("market", {}).get("epic") or pos.get("epic") or "").upper()
                                     if d_id and epic == "GOLD":
                                         d_set.add(d_id)
+                                        d_ref = str(pos.get("dealReference") or pos.get("deal_reference") or "")
+                                        if d_ref:
+                                            d_set.add(d_ref)
+                                            ref_map[d_ref] = d_id
                                 user_broker_open_deals[eng_k] = d_set
+                                user_broker_ref_to_deal[eng_k] = ref_map
                                 successfully_audited_engs.add(eng_k)
                     except Exception as e_b_usr:
                         logger.debug(f"User broker position audit note for {c_id}: {e_b_usr}")
@@ -3146,6 +3159,15 @@ class QuantGoldExecutionEngine:
                 user_eng_k = (cid, is_demo)
                 if user_eng_k in successfully_audited_engs:
                     user_deals = user_broker_open_deals.get(user_eng_k, set())
+                    ref_map = user_broker_ref_to_deal.get(user_eng_k, {})
+                    if str(deal_id) in ref_map:
+                        target_deal = ref_map[str(deal_id)]
+                        if hasattr(db, "update_capital_auto_trade_deal_id"):
+                            db.update_capital_auto_trade_deal_id(str(deal_id), str(target_deal))
+                        logger.info(f"🏛️ [BROKER SYNC] Re-mapped order ref {deal_key} -> broker deal #{target_deal} for user {cid}")
+                        deal_id = target_deal
+                        deal_key = str(deal_id)
+
                     tr_open_ts = float(tr.get("open_time_ts") or tr.get("timestamp") or 0.0)
                     if tr_open_ts > 0 and (now - tr_open_ts) < 25.0:
                         continue
@@ -3153,12 +3175,13 @@ class QuantGoldExecutionEngine:
                         matched_bp = False
                         if str(deal_id).startswith("o_") and user_deals:
                             for bp_deal in user_deals:
-                                if hasattr(db, "update_capital_auto_trade_deal_id"):
-                                    if db.update_capital_auto_trade_deal_id(str(deal_id), str(bp_deal)):
-                                        deal_id = bp_deal
-                                        matched_bp = True
-                                        logger.info(f"🏛️ [BROKER SYNC] Re-mapped order ref {deal_key} -> broker deal #{bp_deal} for user {cid}")
-                                        break
+                                if not bp_deal.startswith("o_"):
+                                    if hasattr(db, "update_capital_auto_trade_deal_id"):
+                                        if db.update_capital_auto_trade_deal_id(str(deal_id), str(bp_deal)):
+                                            deal_id = bp_deal
+                                            matched_bp = True
+                                            logger.info(f"🏛️ [BROKER SYNC] Re-mapped order ref {deal_key} -> broker deal #{bp_deal} for user {cid}")
+                                            break
                         if matched_bp:
                             continue
                         logger.info(f"🏛️ [BROKER SYNC] Gold trade {deal_id} was closed on Capital.com broker for user {cid}.")

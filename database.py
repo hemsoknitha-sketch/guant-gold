@@ -3635,6 +3635,25 @@ def update_capital_auto_trade_scale_tier(deal_id: str, scale_tier: int, status: 
     conn.commit()
     conn.close()
 
+def update_capital_auto_trade_deal_id(old_deal_id: str, new_deal_id: str) -> bool:
+    """Updates deal_id when an order reference (o_...) is remapped to a permanent broker dealId."""
+    if not old_deal_id or not new_deal_id or str(old_deal_id) == str(new_deal_id):
+        return False
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE capital_auto_trades
+            SET deal_id = ?, deal_reference = CASE WHEN deal_reference IS NULL OR deal_reference = '' THEN ? ELSE deal_reference END
+            WHERE (deal_id = ? OR deal_reference = ?) AND status != 'CLOSED'
+        """, (str(new_deal_id), str(old_deal_id), str(old_deal_id), str(old_deal_id)))
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+    except Exception:
+        return False
+
 def get_active_capital_auto_trades(deal_id: Optional[str] = None) -> list:
     """Returns active positions from capital_auto_trades with scale_tier and targets."""
     conn = get_db_connection()
@@ -3647,22 +3666,31 @@ def get_active_capital_auto_trades(deal_id: Optional[str] = None) -> list:
 
     if deal_id:
         cursor.execute("""
-            SELECT id, chat_id, deal_id, deal_reference, epic, direction, size, entry_price, sl, tp, status, tp1, tp2, tp3, sl_dist, scale_tier, tranche_id
+            SELECT id, chat_id, deal_id, deal_reference, epic, direction, size, entry_price, sl, tp, status, tp1, tp2, tp3, sl_dist, scale_tier, tranche_id, is_demo, created_at
             FROM capital_auto_trades
             WHERE (deal_id = ? OR deal_reference = ?) AND (status = 'OPEN' OR status LIKE 'ACTIVE%')
             ORDER BY id DESC
         """, (str(deal_id), str(deal_id)))
     else:
         cursor.execute("""
-            SELECT id, chat_id, deal_id, deal_reference, epic, direction, size, entry_price, sl, tp, status, tp1, tp2, tp3, sl_dist, scale_tier, tranche_id
+            SELECT id, chat_id, deal_id, deal_reference, epic, direction, size, entry_price, sl, tp, status, tp1, tp2, tp3, sl_dist, scale_tier, tranche_id, is_demo, created_at
             FROM capital_auto_trades
             WHERE status = 'OPEN' OR status LIKE 'ACTIVE%'
             ORDER BY id DESC
         """)
     rows = cursor.fetchall()
     conn.close()
-    return [
-        {
+    active_trades = []
+    for r in rows:
+        created_val = r[18] if len(r) > 18 else None
+        open_ts = 0.0
+        if created_val:
+            try:
+                c_clean = str(created_val).replace("T", " ").split(".")[0]
+                open_ts = datetime.strptime(c_clean, "%Y-%m-%d %H:%M:%S").timestamp()
+            except Exception:
+                open_ts = 0.0
+        active_trades.append({
             "id": r[0],
             "chat_id": r[1],
             "deal_id": r[2],
@@ -3679,10 +3707,13 @@ def get_active_capital_auto_trades(deal_id: Optional[str] = None) -> list:
             "tp3": r[13],
             "sl_dist": r[14],
             "scale_tier": r[15],
-            "tranche_id": r[16]
-        }
-        for r in rows
-    ]
+            "tranche_id": r[16],
+            "is_demo": r[17] if len(r) > 17 else 0,
+            "created_at": created_val,
+            "open_time_ts": open_ts,
+            "timestamp": open_ts
+        })
+    return active_trades
 
 def update_capital_auto_trade_close(deal_id: str, exit_price: float, pnl: float):
     """Marks a TradFi trade as closed with final exit price and PnL."""
